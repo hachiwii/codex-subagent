@@ -20,7 +20,8 @@ Each subagent is one Codex thread. While a turn runs, a **host process** owns it
 | completion notification + final report | the task's completion notification; `Read` its output file: the Codex final message verbatim, then messages-to-main, files changed, worktree state |
 | `SendMessage` to a running agent | `CS send N - <<'EOF' … EOF` → inserted into the running turn at once (`turn/steer`), no waiting for a tool boundary |
 | `SendMessage` to a finished agent (resumes it) | the same `send` → a new turn in the same thread (keeps context). **Always run `send` as a background task**: it becomes the host when it starts a new turn |
-| `ListAgents` | `CS list` (this Claude session; `--all` for every session, `--json`) |
+| `ListAgents` | `CS list` (this Claude session; `--all` for every session, with a SESSION column; `--json`) |
+| subagents belong to the session that spawned them | names are per Claude session; `N` means this session's subagent, else the only one of that name anywhere; `<session id prefix>/N` addresses another session's |
 | `TaskStop` | `TaskStop` on the host task, or `CS stop N` |
 | agent transcript / output file | `CS log N` (progress), `CS result N` (last final message), `CS status N`, `CS transcript N` (raw app-server events) |
 | subagent `SendMessage` to main | Codex runs `CS notify "…"`; arm `Monitor` on `CS watch N` to be notified at once (Monitor expires after ≤30 min: re-arm; a re-armed watch repeats approval requests still waiting). Otherwise they appear in the turn report |
@@ -98,7 +99,8 @@ When the notification arrives, `Read` the output file and relay what matters; do
 
 ## Notes
 
-- Codex binary: `$CODEX_BIN`, else the ChatGPT app's bundled CLI, else `codex` on PATH. State: `~/.claude/codex-subagents/<name>/`.
+- Codex binary: `$CODEX_BIN`, else the ChatGPT app's bundled CLI, else `codex` on PATH.
+- State: `~/.claude/codex-subagents/<claude session id>/<name>/` (`no-session` when run outside Claude Code); a subagent keeps the session that created it even when another session continues it. Subagents from the earlier flat layout (`…/<name>/`) are moved there automatically once they are not running.
 - `--worktree` branches from the HEAD of the directory `start` runs in: `cd` to the main checkout first, not into another agent's worktree.
-- Names: a-z, 0-9, `-`, ≤40 chars; unique across sessions (`CS rm N` frees a name; it keeps a worktree that has changes).
+- Names: a-z, 0-9, `-`, ≤40 chars; unique within a session (`CS rm N` frees a name; it keeps a worktree that has changes). Two sessions may use the same name; in one repository the second one's worktree gets a suffix (`codex-N-ab12`).
 - TaskStop sends SIGTERM to the task's process group and SIGKILL ~1.5 s later; the host records the stop immediately and app-server, in the same group, stops the turn and its commands.

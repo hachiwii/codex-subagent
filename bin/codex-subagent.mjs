@@ -133,13 +133,22 @@ function readText(words, file) {
 
 // ---------- agent state ----------
 
-function paths(name) {
-  const dir = path.join(HOME, name);
+// Layout: HOME/<claude session id>/<name>/. A directory directly under HOME that holds an agent.json
+// is the earlier flat layout: it is moved into place once no host runs in it and used in place until then.
+const NO_SESSION = "no-session";
+const sessionDir = (sessionId) => path.join(HOME, sessionId ?? NO_SESSION);
+const isFlatDir = (dir) => path.dirname(dir) === HOME;
+
+function paths(dir) {
   return {
     dir,
     agent: path.join(dir, "agent.json"),
     lock: path.join(dir, "host.json"),
-    sock: path.join(dir, "ctl.sock"),
+    // <session id>/<name>/ctl.sock would exceed the ~100 byte limit of a socket path, so the socket gets a
+    // short name of its own. A host started in a flat directory listens inside it.
+    sock: isFlatDir(dir)
+      ? path.join(dir, "ctl.sock")
+      : path.join(HOME, ".sock", `${crypto.createHash("sha1").update(dir).digest("hex").slice(0, 16)}.sock`),
     transcript: path.join(dir, "transcript.jsonl"),
     events: path.join(dir, "events.jsonl"),
     progress: path.join(dir, "progress.log"),
@@ -148,51 +157,96 @@ function paths(name) {
     prompts: path.join(dir, "prompts"),
   };
 }
-function loadAgent(name) {
-  if (!name) die("missing subagent name");
-  const a = readJson(paths(name).agent);
-  if (!a) die(`no codex subagent named "${name}" (see: list --all)`);
-  return a;
+// An agent carries the directory it was read from; it is not part of agent.json.
+function readAgent(dir) {
+  const a = readJson(path.join(dir, "agent.json"));
+  return a ? Object.defineProperty(a, "dir", { value: dir, enumerable: false }) : null;
 }
-function saveAgent(a) {
-  a.updatedAt = now();
-  writeJsonAtomic(paths(a.name).agent, a);
+function hostAlive(dir) {
+  const held = readJson(path.join(dir, "host.json"));
+  return Boolean(held && pidAlive(held.pid));
+}
+function agentDirs() {
+  if (!fs.existsSync(HOME)) return [];
+  const dirs = [];
+  for (const entry of fs.readdirSync(HOME, { withFileTypes: true })) {
+    if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
+    const dir = path.join(HOME, entry.name);
+    if (fs.existsSync(path.join(dir, "agent.json"))) dirs.push(dir);
+    else for (const sub of fs.readdirSync(dir)) dirs.push(path.join(dir, sub));
+  }
+  return dirs;
 }
 function allAgents() {
-  if (!fs.existsSync(HOME)) return [];
-  return fs
-    .readdirSync(HOME)
-    .map((n) => readJson(path.join(HOME, n, "agent.json")))
+  return agentDirs()
+    .map(readAgent)
     .filter(Boolean)
     .sort((x, y) => x.createdAt.localeCompare(y.createdAt));
 }
-function note(name, kind, text) {
-  const p = paths(name);
+// Moves flat-layout agents to HOME/<their session id>/<name>. One with a running host is left alone:
+// the host has the old paths in memory.
+function migrateFlatLayout() {
+  for (const dir of agentDirs().filter(isFlatDir)) {
+    const a = readAgent(dir);
+    if (!a || hostAlive(dir)) continue;
+    const target = path.join(sessionDir(a.sessionId), a.name);
+    if (fs.existsSync(target)) continue;
+    try {
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.rmSync(path.join(dir, "host.json"), { force: true });
+      fs.rmSync(path.join(dir, "ctl.sock"), { force: true });
+      fs.renameSync(dir, target);
+    } catch (e) {
+      if (!["ENOENT", "EACCES", "EPERM", "EROFS"].includes(e.code)) throw e; // moved by another invocation, or read-only here
+    }
+  }
+}
+// "name" is the subagent of this session, else the only one of that name in any session;
+// "<session id prefix>/name" picks one explicitly.
+function loadAgent(addr) {
+  if (!addr) die("missing subagent name");
+  const slash = addr.lastIndexOf("/");
+  const [prefix, name] = slash >= 0 ? [addr.slice(0, slash), addr.slice(slash + 1)] : [null, addr];
+  const sid = (a) => a.sessionId ?? NO_SESSION;
+  const named = allAgents().filter((a) => a.name === name);
+  let hits = prefix === null ? named.filter((a) => sid(a) === (SESSION ?? NO_SESSION)) : named.filter((a) => sid(a).startsWith(prefix));
+  if (!hits.length && prefix === null) hits = named;
+  if (hits.length === 1) return hits[0];
+  if (!hits.length) die(`no codex subagent named "${addr}" (see: list --all)`);
+  die(`"${addr}" matches several subagents; use one of: ${hits.map((a) => `${sid(a).slice(0, 8)}/${a.name}`).join(", ")}`);
+}
+function saveAgent(a) {
+  a.updatedAt = now();
+  writeJsonAtomic(paths(a.dir).agent, a);
+}
+function note(a, kind, text) {
+  const p = paths(a.dir);
   const t = new Date();
   fs.appendFileSync(p.progress, `${t.toTimeString().slice(0, 8)} ${text}\n`);
   fs.appendFileSync(p.events, `${JSON.stringify({ t: t.toISOString(), kind, text })}\n`);
 }
-function savePrompt(name, label, text) {
-  const dir = paths(name).prompts;
+function savePrompt(a, label, text) {
+  const dir = paths(a.dir).prompts;
   const n = fs.readdirSync(dir).length + 1;
   fs.writeFileSync(path.join(dir, `${String(n).padStart(3, "0")}-${label}.md`), text);
 }
 
 // One host per agent. The lock file names the holder; a holder that is gone, or that neither answers
 // on the control socket nor is still starting up, is stale.
-async function acquireLock(name, waitMs = 0) {
-  const p = paths(name);
+async function acquireLock(a, waitMs = 0) {
+  const p = paths(a.dir);
   const deadline = Date.now() + waitMs;
   for (;;) {
     try {
       fs.writeFileSync(p.lock, JSON.stringify({ pid: process.pid, startedAt: now() }), { flag: "wx" });
       return true;
     } catch (e) {
+      if (e.code === "ENOENT") return false; // the directory was moved (layout migration) while we waited
       if (e.code !== "EEXIST") throw e;
     }
     const held = readJson(p.lock);
     const young = held && Date.now() - Date.parse(held.startedAt) < 30_000;
-    const stale = !held || !pidAlive(held.pid) || (!young && !(await control(name, { op: "ping" }, 2000)));
+    const stale = !held || !pidAlive(held.pid) || (!young && !(await control(a, { op: "ping" }, 2000)));
     if (stale) {
       fs.rmSync(p.lock, { force: true });
       continue;
@@ -201,15 +255,15 @@ async function acquireLock(name, waitMs = 0) {
     await sleep(200);
   }
 }
-function releaseLock(name) {
-  const p = paths(name);
+function releaseLock(a) {
+  const p = paths(a.dir);
   if (readJson(p.lock)?.pid === process.pid) fs.rmSync(p.lock, { force: true });
 }
 
 // Request/response over the host's control socket; null when no host answers.
-function control(name, req, timeoutMs = 3000) {
+function control(a, req, timeoutMs = 3000) {
   return new Promise((resolve) => {
-    const sock = net.createConnection(paths(name).sock);
+    const sock = net.createConnection(paths(a.dir).sock);
     let buf = "";
     const timer = setTimeout(() => {
       sock.destroy();
@@ -336,15 +390,29 @@ function approvalResponse(method, p, decision) {
 
 // ---------- worktree isolation ----------
 
+const branchExists = (repoRoot, branch) => git(repoRoot, "rev-parse", "--verify", "--quiet", `refs/heads/${branch}`).ok;
+// Names are per session, worktrees per repository: a second subagent of the same name gets a suffix.
+function newWorktree(repoRoot, name) {
+  for (const suffix of ["", `-${crypto.randomBytes(2).toString("hex")}`]) {
+    const id = `codex-${name}${suffix}`;
+    const wt = { path: path.join(repoRoot, ".claude", "worktrees", id), branch: `worktree-${id}`, base: null, removed: true };
+    if (!fs.existsSync(wt.path) && !branchExists(repoRoot, wt.branch)) return wt;
+  }
+  die(`cannot find a free worktree name for "${name}" in ${repoRoot}`);
+}
 function ensureWorktree(a) {
   const wt = a.worktree;
   if (!wt.removed && fs.existsSync(wt.path)) return;
   const base = git(a.repoRoot, "rev-parse", "HEAD");
   if (!base.ok) die(`worktree: ${a.repoRoot} has no commits`, 1);
   git(a.repoRoot, "worktree", "prune");
-  const r = git(a.repoRoot, "worktree", "add", "-B", wt.branch, wt.path, base.out);
+  // A branch that is still there (its worktree directory was removed by hand) keeps its commits.
+  const kept = branchExists(a.repoRoot, wt.branch);
+  const r = kept
+    ? git(a.repoRoot, "worktree", "add", wt.path, wt.branch)
+    : git(a.repoRoot, "worktree", "add", "-b", wt.branch, wt.path, base.out);
   if (!r.ok) die(`git worktree add failed: ${r.err}`, 1);
-  wt.base = base.out;
+  if (!kept || !wt.base) wt.base = base.out;
   wt.removed = false;
   a.cwd = wt.path;
 }
@@ -458,7 +526,7 @@ const textInput = (text) => [{ type: "text", text, text_elements: [] }];
 class Host {
   constructor(agent) {
     this.a = agent;
-    this.p = paths(agent.name);
+    this.p = paths(agent.dir);
     this.turnId = null;
     this.turnActive = false;
     this.nextTurn = []; // coordinator messages that arrived when no turn could take them
@@ -479,7 +547,7 @@ class Host {
     this.turnStartedAt = Date.now();
   }
   note(kind, text) {
-    note(this.a.name, kind, text);
+    note(this.a, kind, text);
   }
   out(text) {
     process.stdout.write(`${text}\n`);
@@ -534,6 +602,7 @@ class Host {
   }
 
   listen() {
+    fs.mkdirSync(path.dirname(this.p.sock), { recursive: true });
     fs.rmSync(this.p.sock, { force: true });
     this.ctl = net.createServer((sock) => {
       sock.on("error", () => {});
@@ -568,7 +637,7 @@ class Host {
             expectedTurnId: this.turnId,
             input: textInput(req.text),
           });
-          savePrompt(this.a.name, "steer", req.text);
+          savePrompt(this.a, "steer", req.text);
           this.note("steer", `⇢ coordinator (steered): ${oneLine(req.text)}`);
           return { ok: true, mode: "steer" };
         } catch (e) {
@@ -601,7 +670,7 @@ class Host {
     this.resetTurn();
     this.turnId = null;
     this.gitBefore = gitSnapshot(a.cwd);
-    savePrompt(a.name, label, text);
+    savePrompt(a, label, text);
     const res = await this.server.request("turn/start", {
       threadId: a.threadId,
       input: textInput(text),
@@ -821,7 +890,7 @@ class Host {
     this.note("host-exit", `□ host exited (${status})`);
     this.ctl?.close();
     fs.rmSync(this.p.sock, { force: true });
-    releaseLock(a.name);
+    releaseLock(a);
     this.server?.close();
     process.exitCode = EXIT[status];
     this.resolveDone(status);
@@ -835,12 +904,12 @@ class Host {
 
 async function runRemote(a, text) {
   const branch = a.remote.branch ?? git(a.cwd, "rev-parse", "--abbrev-ref", "HEAD").out;
-  savePrompt(a.name, "task", text);
+  savePrompt(a, "task", text);
   const sub = spawnSync(codexBin(), ["cloud", "exec", "--env", a.remote.env, "--branch", branch, text], { cwd: a.cwd, encoding: "utf8" });
   if (sub.status !== 0) {
     a.status = "failed";
     saveAgent(a);
-    releaseLock(a.name);
+    releaseLock(a);
     die(`codex cloud exec failed: ${oneLine(sub.stderr || sub.stdout, 500)}`, 1);
   }
   const id = sub.stdout.match(/\btask_[A-Za-z0-9_-]+/)?.[0] ?? sub.stdout.trim().split(/\s+/).at(-1);
@@ -848,7 +917,7 @@ async function runRemote(a, text) {
   a.status = "running";
   a.hostPid = process.pid;
   saveAgent(a);
-  note(a.name, "turn-start", `▶ submitted to Codex Cloud: ${id}`);
+  note(a, "turn-start", `▶ submitted to Codex Cloud: ${id}`);
   console.log(`codex-subagent ${a.name}: submitted to Codex Cloud as ${id} (env ${a.remote.env}, branch ${branch})`);
   let stopped = null;
   for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"]) process.on(sig, () => (stopped = sig));
@@ -858,7 +927,7 @@ async function runRemote(a, text) {
     try {
       task = JSON.parse(list.stdout).tasks?.find((t) => t.id === id) ?? task;
     } catch {
-      note(a.name, "error", `! codex cloud list: ${oneLine(list.stderr || list.stdout, 200)}`);
+      note(a, "error", `! codex cloud list: ${oneLine(list.stderr || list.stdout, 200)}`);
     }
     const st = String(task?.status ?? "").toLowerCase();
     if (st && !/pending|queued|running|progress/.test(st)) break;
@@ -867,13 +936,13 @@ async function runRemote(a, text) {
   a.status = stopped ? "stopped" : /fail|error|cancel/.test(String(task?.status).toLowerCase()) ? "failed" : "completed";
   a.hostPid = null;
   saveAgent(a);
-  releaseLock(a.name);
+  releaseLock(a);
   if (stopped) {
     console.log(`\n━━ codex-subagent ${a.name} · stopped watching (${stopped}) ━━\nCodex Cloud has no cancel command; task ${id} keeps running there.`);
     process.exit(EXIT.stopped);
   }
   const diff = spawnSync(codexBin(), ["cloud", "diff", id], { encoding: "utf8" }).stdout ?? "";
-  fs.writeFileSync(paths(a.name).result, JSON.stringify(task, null, 2));
+  fs.writeFileSync(paths(a.dir).result, JSON.stringify(task, null, 2));
   console.log(`\n━━ codex-subagent ${a.name} · ${a.status} (Codex Cloud ${id}) ━━\n${JSON.stringify(task, null, 2)}\n\n── diff (apply with: codex cloud apply ${id}) ──\n${diff.slice(0, 20_000)}`);
   process.exit(EXIT[a.status]);
 }
@@ -904,15 +973,17 @@ async function cmdStart(argv) {
   if (wantWorktree && !repoRoot) die("--worktree needs a git repository");
   if (opts.remote && !opts.env) die("--remote needs --env <Codex Cloud environment id>");
 
-  fs.mkdirSync(HOME, { recursive: true });
-  const p = paths(name);
+  const exists = () => die(`"${name}" already exists in this session; continue it with send, or remove it with rm`);
+  if (allAgents().some((x) => x.name === name && (x.sessionId ?? null) === SESSION)) exists();
+  const dir = path.join(sessionDir(SESSION), name);
+  fs.mkdirSync(sessionDir(SESSION), { recursive: true });
   try {
-    fs.mkdirSync(p.dir);
+    fs.mkdirSync(dir);
   } catch (e) {
-    if (e.code === "EEXIST") die(`"${name}" already exists; continue it with send, or remove it with rm`);
+    if (e.code === "EEXIST") exists();
     throw e;
   }
-  fs.mkdirSync(p.prompts);
+  fs.mkdirSync(paths(dir).prompts);
   const instructions = [
     baseInstructions(name, perms.approval),
     role?.meta.extends && claudeAgentBody(role.meta.extends, repoRoot),
@@ -935,26 +1006,26 @@ async function cmdStart(argv) {
     status: "starting",
     threadId: null,
     turns: [],
-    worktree: wantWorktree
-      ? { path: path.join(repoRoot, ".claude", "worktrees", `codex-${name}`), branch: `worktree-codex-${name}`, base: null, removed: true }
-      : null,
+    worktree: wantWorktree ? newWorktree(repoRoot, name) : null,
     remote: opts.remote ? { env: opts.env, branch: opts.branch ?? null } : null,
   };
+  Object.defineProperty(a, "dir", { value: dir, enumerable: false });
   saveAgent(a);
-  await acquireLock(name);
+  await acquireLock(a);
   if (a.remote) return runRemote(a, text);
   return new Host(a).run(text);
 }
 
 async function cmdSend(argv) {
   const { opts, pos } = parseArgs(argv, { values: ["file", "mode", "sandbox", "approval"] });
-  const [name, ...words] = pos;
-  const a = loadAgent(name);
+  const [addr, ...words] = pos;
+  const a = loadAgent(addr);
+  const name = a.name;
   const text = readText(words, opts.file).trim();
   if (!text) die("empty message");
   const newPerms = opts.mode || opts.sandbox || opts.approval;
   if (a.remote) die("remote (Codex Cloud) subagents cannot take messages: Codex Cloud cannot steer or continue a task");
-  const r = await control(name, { op: "send", text }, 30_000);
+  const r = await control(a, { op: "send", text }, 30_000);
   if (r?.ok) {
     console.log(
       r.mode === "steer"
@@ -965,8 +1036,10 @@ async function cmdSend(argv) {
     return;
   }
   // No host (or it is finishing): become the host and continue the thread in a new turn.
-  if (!(await acquireLock(name, 30_000))) die(`${name} has a host that does not respond; try again or stop it`, 1);
-  const fresh = loadAgent(name);
+  for (let i = 0; i < 150 && hostAlive(a.dir); i++) await sleep(200);
+  migrateFlatLayout(); // a host that just left a flat directory frees it to be moved
+  const fresh = loadAgent(addr);
+  if (!(await acquireLock(fresh, 30_000))) die(`${name} has a host that does not respond; try again or stop it`, 1);
   if (newPerms) {
     const mode = opts.mode ?? fresh.mode ?? null;
     Object.assign(fresh, { mode }, resolvePermissions(mode, fresh.rolePerms, opts));
@@ -975,25 +1048,25 @@ async function cmdSend(argv) {
 }
 
 async function cmdStop(argv) {
-  const [name] = parseArgs(argv).pos;
-  const a = loadAgent(name);
+  const a = loadAgent(parseArgs(argv).pos[0]);
+  const name = a.name;
   if (a.remote && a.hostPid && pidAlive(a.hostPid)) {
     process.kill(a.hostPid, "SIGTERM");
     return console.log(`${name}: stopped watching; Codex Cloud has no cancel, the task keeps running there`);
   }
-  const r = await control(name, { op: "stop", reason: "stop command" });
+  const r = await control(a, { op: "stop", reason: "stop command" });
   if (!r?.ok) return console.log(`${name} is not running (${liveStatus(a, null)})`);
-  for (let i = 0; i < 60 && fs.existsSync(paths(name).lock); i++) await sleep(250);
-  console.log(`${name}: ${loadAgent(name).status}`);
+  for (let i = 0; i < 60 && fs.existsSync(paths(a.dir).lock); i++) await sleep(250);
+  console.log(`${name}: ${readAgent(a.dir).status}`);
 }
 
 async function cmdAnswer(verb, argv) {
   const { opts, pos } = parseArgs(argv, { values: ["reason"], flags: ["session", "cancel"] });
-  const [name, id] = pos;
-  loadAgent(name);
+  const a = loadAgent(pos[0]);
+  const [name, id] = [a.name, pos[1]];
   if (!id) die(`usage: ${verb} <name> <approval number>`);
   const decision = verb === "approve" ? (opts.session ? "approve-session" : "approve") : opts.cancel ? "cancel" : "deny";
-  const r = await control(name, { op: "answer", id, decision, reason: opts.reason }, 20_000);
+  const r = await control(a, { op: "answer", id, decision, reason: opts.reason }, 20_000);
   if (!r) die(`${name} is not running`, 1);
   if (!r.ok) die(r.error, 1);
   console.log(`${name}: approval #${id} → ${decision}`);
@@ -1016,9 +1089,10 @@ async function cmdList(argv) {
   const agents = allAgents().filter((a) => opts.all || !SESSION || a.sessionId === SESSION);
   const rows = [];
   for (const a of agents) {
-    const ping = a.hostPid ? await control(a.name, { op: "ping" }, 1500) : null;
+    const ping = a.hostPid ? await control(a, { op: "ping" }, 1500) : null;
     const status = liveStatus(a, ping);
     rows.push({
+      session: a.sessionId ?? NO_SESSION,
       name: a.name,
       status,
       role: a.role ?? "-",
@@ -1031,29 +1105,30 @@ async function cmdList(argv) {
   }
   if (opts.json) return console.log(JSON.stringify(rows, null, 2));
   if (!rows.length) return console.log(opts.all ? "no codex subagents" : "no codex subagents in this session (list --all shows every session)");
+  const session = opts.all ? [["SESSION"], (r) => [r.session.slice(0, 8)]] : [[], () => []];
   console.log(
     table([
-      ["NAME", "STATUS", "ROLE", "TURNS", "STARTED", "LAST ACTIVITY", "WHERE", "DESCRIPTION"],
-      ...rows.map((r) => [r.name, r.status, r.role, r.turns, r.started, r.lastActivity, r.where, r.description]),
+      [...session[0], "NAME", "STATUS", "ROLE", "TURNS", "STARTED", "LAST ACTIVITY", "WHERE", "DESCRIPTION"],
+      ...rows.map((r) => [...session[1](r), r.name, r.status, r.role, r.turns, r.started, r.lastActivity, r.where, r.description]),
     ]),
   );
 }
 
 async function cmdStatus(argv) {
-  const [name] = parseArgs(argv).pos;
-  const a = loadAgent(name);
-  const ping = a.hostPid ? await control(name, { op: "ping" }, 1500) : null;
-  const p = paths(name);
+  const a = loadAgent(parseArgs(argv).pos[0]);
+  const ping = a.hostPid ? await control(a, { op: "ping" }, 1500) : null;
+  const p = paths(a.dir);
   const lines = [
     `name:        ${a.name}${a.description ? ` — ${a.description}` : ""}`,
     `status:      ${liveStatus(a, ping)}${a.hostPid ? ` (host pid ${a.hostPid})` : ""}`,
+    `session:     ${a.sessionId ?? NO_SESSION}`,
     `role:        ${a.role ?? "-"}`,
     `thread:      ${a.threadId ?? "-"}`,
     `model:       ${a.actual?.model ?? a.model ?? "default"} / effort ${a.effort ?? a.actual?.effort ?? "default"}`,
     `permissions: mode ${a.mode ?? "-"} → sandbox ${a.actual?.sandbox ?? a.sandbox ?? "default"}, approval ${a.approval ?? "never"}`,
     `cwd:         ${a.cwd}`,
   ];
-  const pend = ping?.pending ? await control(name, { op: "pending" }, 1500) : null;
+  const pend = ping?.pending ? await control(a, { op: "pending" }, 1500) : null;
   for (const r of pend?.pending ?? []) lines.push(`pending:     #${r.id} ${r.text}`);
   if (a.worktree) lines.push(`worktree:    ${worktreeSummary(a.worktree)}`);
   if (a.remote) lines.push(`remote:      Codex Cloud task ${a.remote.taskId ?? "?"} (env ${a.remote.env})`);
@@ -1076,33 +1151,28 @@ function tail(file, n) {
 
 function cmdLog(argv) {
   const { opts, pos } = parseArgs(argv, { values: ["lines"], alias: { n: "lines" } });
-  loadAgent(pos[0]);
-  console.log(tail(paths(pos[0]).progress, Number(opts.lines ?? 40)) || "(no progress yet)");
+  console.log(tail(paths(loadAgent(pos[0]).dir).progress, Number(opts.lines ?? 40)) || "(no progress yet)");
 }
 
 function cmdResult(argv) {
-  const [name] = parseArgs(argv).pos;
-  loadAgent(name);
-  const f = paths(name).result;
+  const f = paths(loadAgent(parseArgs(argv).pos[0]).dir).result;
   console.log(fs.existsSync(f) ? fs.readFileSync(f, "utf8") : "(no result yet)");
 }
 
 function cmdTranscript(argv) {
-  const [name] = parseArgs(argv).pos;
-  loadAgent(name);
-  console.log(paths(name).transcript);
+  console.log(paths(loadAgent(parseArgs(argv).pos[0]).dir).transcript);
 }
 
 // For the Monitor tool: one line per event worth interrupting the coordinator for; exits with the host.
 async function cmdWatch(argv) {
   const { opts, pos } = parseArgs(argv, { flags: ["verbose", "from-start"] });
-  const name = pos[0];
-  loadAgent(name);
-  const p = paths(name);
+  const a = loadAgent(pos[0]);
+  const name = a.name;
+  const p = paths(a.dir);
   const kinds = new Set(["to-main", "question", "approval", "error", "turn-end", "host-exit"]);
   if (opts.verbose) for (const k of ["commentary", "command", "file", "tool", "steer", "turn-start", "approval-answer"]) kinds.add(k);
   if (!opts["from-start"]) {
-    const pend = await control(name, { op: "pending" }, 1500);
+    const pend = await control(a, { op: "pending" }, 1500);
     for (const r of pend?.pending ?? []) console.log(`[${name}] ⚠ approval #${r.id} (still waiting) — ${r.text} → answer: approve ${name} ${r.id} | deny ${name} ${r.id} --reason "…"`);
   }
   let offset = opts["from-start"] || !fs.existsSync(p.events) ? 0 : fs.statSync(p.events).size;
@@ -1124,7 +1194,7 @@ async function cmdWatch(argv) {
       }
       idle = 0;
     } else if (!fs.existsSync(p.lock) && ++idle > 20) {
-      return console.log(`[${name}] not running (${loadAgent(name).status})`);
+      return console.log(`[${name}] not running (${readAgent(a.dir)?.status ?? "removed"})`);
     }
     await sleep(500);
   }
@@ -1157,15 +1227,17 @@ function cmdRoles() {
 async function cmdRm(argv) {
   const { opts, pos } = parseArgs(argv, { flags: ["force"] });
   const a = loadAgent(pos[0]);
-  if (await control(a.name, { op: "ping" }, 1500)) {
+  if (await control(a, { op: "ping" }, 1500)) {
     if (!opts.force) die(`${a.name} is running; stop it first or use --force`);
-    await cmdStop([a.name]);
+    await cmdStop([pos[0]]);
   }
   if (a.worktree && !a.worktree.removed && fs.existsSync(a.worktree.path)) {
     cleanupWorktreeIfUnchanged(a);
     if (!a.worktree.removed) console.log(`kept worktree with changes: ${worktreeSummary(a.worktree)}`);
   }
-  fs.rmSync(paths(a.name).dir, { recursive: true, force: true });
+  fs.rmSync(paths(a.dir).sock, { force: true });
+  fs.rmSync(a.dir, { recursive: true, force: true });
+  if (!isFlatDir(a.dir) && fs.readdirSync(path.dirname(a.dir)).length === 0) fs.rmdirSync(path.dirname(a.dir));
   console.log(`removed ${a.name}`);
 }
 
@@ -1181,6 +1253,8 @@ const USAGE = `codex-subagent — Codex threads as Claude Code subagents
   approve <name> <n> [--session]           grant approval request n (--session: also similar later ones)
   deny <name> <n> [--reason TEXT] [--cancel]   refuse it; the reason is passed to Codex (--cancel: also interrupt)
   list [--all] [--json]                    subagents of this Claude session (or all)
+  <name> is a subagent of this session, else the only one of that name anywhere;
+  <session id prefix>/<name> picks one of another session.
   status <name>        log <name> [-n N]        result <name>        transcript <name>
   watch <name> [--verbose] [--from-start]  event stream for the Monitor tool
   notify MESSAGE                           (for Codex) interim message to the coordinator
@@ -1209,4 +1283,5 @@ if (!commands[cmd]) {
   process.stdout.write(USAGE);
   process.exit(cmd && cmd !== "help" && cmd !== "--help" ? 2 : 0);
 }
+if (cmd !== "notify") migrateFlatLayout();
 await commands[cmd](rest);
