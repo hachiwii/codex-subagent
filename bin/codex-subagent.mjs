@@ -24,6 +24,9 @@ const SESSION = process.env.CLAUDE_CODE_SESSION_ID ?? null;
 const TO_MAIN = "[[codex-subagent:to-main]]";
 const NAME_RE = /^[a-z0-9][a-z0-9-]{0,39}$/;
 const SANDBOXES = ["read-only", "workspace-write", "danger-full-access"];
+// Events worth interrupting the coordinator for: the host prints them as they happen and `watch` waits for them.
+const STREAM_KINDS = new Set(["to-main", "question", "error", "turn-end", "host-exit"]);
+const VERBOSE_KINDS = new Set([...STREAM_KINDS, "commentary", "command", "file", "tool", "steer", "turn-start"]);
 const EXIT = { completed: 0, failed: 1, stopped: 0 }; // a stop is requested, not a failure
 const NO_USER_ANSWER =
   "No interactive user is available. Decide yourself if you reasonably can and say what you assumed; " +
@@ -128,6 +131,7 @@ function paths(name) {
     result: path.join(dir, "result.md"),
     serverLog: path.join(dir, "app-server.log"),
     prompts: path.join(dir, "prompts"),
+    cursor: path.join(dir, "watch.json"),
   };
 }
 function loadAgent(name) {
@@ -395,14 +399,13 @@ class Host {
   resetTurn() {
     this.finalText = null;
     this.lastText = null;
-    this.toMain = [];
-    this.questions = [];
     this.changed = new Set();
     this.errorText = null;
     this.turnStartedAt = Date.now();
   }
   note(kind, text) {
     note(this.a.name, kind, text);
+    if (STREAM_KINDS.has(kind)) this.out(`[${this.a.name}] ${text}`);
   }
   out(text) {
     process.stdout.write(`${text}\n`);
@@ -563,9 +566,7 @@ class Host {
         this.note("command", `$ ${oneLine(item.command, 160)} → ${item.exitCode ?? item.status}`);
         for (const line of String(item.aggregatedOutput ?? "").split("\n")) {
           if (!line.startsWith(TO_MAIN)) continue;
-          const msg = line.slice(TO_MAIN.length).trim();
-          this.toMain.push(msg);
-          this.note("to-main", `✉ ${msg}`);
+          this.note("to-main", `✉ ${line.slice(TO_MAIN.length).trim()}`);
         }
         break;
       }
@@ -588,10 +589,7 @@ class Host {
   async onRequest(method, p) {
     if (method === "item/tool/requestUserInput") {
       const qs = p.questions ?? [];
-      for (const q of qs) {
-        this.questions.push(q.question);
-        this.note("question", `? ${oneLine(q.question, 300)} (answered: no interactive user)`);
-      }
+      for (const q of qs) this.note("question", `? ${oneLine(q.question, 300)} (answered: no interactive user)`);
       return { answers: Object.fromEntries(qs.map((q) => [q.id, { answers: [NO_USER_ANSWER] }])) };
     }
     const declined = {
@@ -645,9 +643,6 @@ class Host {
       `━━ codex-subagent ${a.name} · ${status}${this.stopReason ? ` (${this.stopReason})` : ""} · turn ${a.turns.length} · ${fmtDur(turn?.durationMs ?? 0)}${tokens} ━━`,
       final ?? "(no final message)",
     ];
-    if (this.toMain.length) lines.push("", "── messages to main during this turn ──", ...this.toMain.map((m) => `- ${m}`));
-    if (this.questions.length)
-      lines.push("", "── questions Codex asked mid-turn (answered: no interactive user) ──", ...this.questions.map((q) => `- ${q}`));
     if (errorText) lines.push("", "── error ──", errorText);
     const changed = new Set([...this.changed, ...gitChangesSince(a.cwd, this.gitBefore)]);
     if (changed.size) lines.push("", "── files changed this turn ──", [...changed].join(", "));
@@ -697,12 +692,12 @@ class Host {
   fail(message) {
     if (this.finishing) return;
     this.errorText = message;
-    this.note("error", `! ${oneLine(message, 300)}`);
+    this.note("error", `! ${oneLine(message, 1000)}`);
     if (this.turnActive) {
       this.turnActive = false;
       this.a.turns.push({ id: this.turnId, startedAt: new Date(this.turnStartedAt).toISOString(), endedAt: now(), status: "failed", durationMs: Date.now() - this.turnStartedAt, error: message });
     }
-    this.out(`\n━━ codex-subagent ${this.a.name} · failed ━━\n${message}`);
+    this.out(`\n━━ codex-subagent ${this.a.name} · failed ━━`);
     this.finish("failed");
   }
 
@@ -964,34 +959,55 @@ function cmdTranscript(argv) {
   console.log(paths(name).transcript);
 }
 
-// For the Monitor tool: one line per event worth interrupting the coordinator for; exits with the host.
+// Long poll, for callers that cannot follow the host's output: returns the events that arrived since the
+// previous watch returned — at once if there are any, otherwise as soon as the next ones arrive.
 async function cmdWatch(argv) {
   const { opts, pos } = parseArgs(argv, { flags: ["verbose", "from-start"] });
   const name = pos[0];
-  loadAgent(name);
+  if (!name) die("usage: watch <name> [--verbose] [--from-start]");
   const p = paths(name);
-  const kinds = new Set(["to-main", "question", "error", "turn-end", "host-exit"]);
-  if (opts.verbose) for (const k of ["commentary", "command", "file", "tool", "steer", "turn-start"]) kinds.add(k);
-  let offset = opts["from-start"] || !fs.existsSync(p.events) ? 0 : fs.statSync(p.events).size;
-  let idle = 0;
-  for (;;) {
+  // The host may have been launched a moment ago in another task.
+  for (let i = 0; i < 30 && !fs.existsSync(p.agent); i++) await sleep(500);
+  loadAgent(name);
+  const kinds = opts.verbose ? VERBOSE_KINDS : STREAM_KINDS;
+  let offset = opts["from-start"] ? 0 : (readJson(p.cursor)?.offset ?? 0);
+  const readNew = () => {
     const size = fs.existsSync(p.events) ? fs.statSync(p.events).size : 0;
-    if (size > offset) {
-      const fd = fs.openSync(p.events, "r");
-      const buf = Buffer.alloc(size - offset);
-      fs.readSync(fd, buf, 0, buf.length, offset);
-      fs.closeSync(fd);
-      const text = buf.toString("utf8");
-      const complete = text.lastIndexOf("\n") + 1;
-      offset += Buffer.byteLength(text.slice(0, complete));
-      for (const line of text.slice(0, complete).split("\n").filter(Boolean)) {
-        const ev = JSON.parse(line);
-        if (kinds.has(ev.kind)) console.log(`[${name}] ${ev.text}`);
-        if (ev.kind === "host-exit") return;
-      }
-      idle = 0;
-    } else if (!fs.existsSync(p.lock) && ++idle > 20) {
-      return console.log(`[${name}] not running (${loadAgent(name).status})`);
+    if (size <= offset) return [];
+    const fd = fs.openSync(p.events, "r");
+    const buf = Buffer.alloc(size - offset);
+    fs.readSync(fd, buf, 0, buf.length, offset);
+    fs.closeSync(fd);
+    const complete = buf.subarray(0, buf.lastIndexOf(0x0a) + 1);
+    offset += complete.length;
+    writeJsonAtomic(p.cursor, { offset });
+    return complete
+      .toString("utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => JSON.parse(l))
+      .filter((ev) => kinds.has(ev.kind))
+      .map((ev) => ev.text);
+  };
+  const hostHeld = () => {
+    const held = readJson(p.lock);
+    return Boolean(held && pidAlive(held.pid));
+  };
+  let unheld = 0;
+  for (;;) {
+    let hits = readNew();
+    if (hits.length) {
+      await sleep(300); // the rest of a burst, e.g. turn end followed by host exit
+      hits = hits.concat(readNew());
+      for (const text of hits) console.log(`[${name}] ${text}`);
+      return;
+    }
+    // A host that was just launched (start, or send resuming the thread) takes a moment to appear.
+    unheld = hostHeld() ? 0 : unheld + 1;
+    if (unheld > 10) {
+      console.log(`[${name}] not running (${loadAgent(name).status}), no new events`);
+      process.exitCode = 1;
+      return;
     }
     await sleep(500);
   }
@@ -1045,7 +1061,7 @@ const USAGE = `codex-subagent — Codex threads as Claude Code subagents
   stop <name>                              interrupt the running turn
   list [--all] [--json]                    subagents of this Claude session (or all)
   status <name>        log <name> [-n N]        result <name>        transcript <name>
-  watch <name> [--verbose] [--from-start]  event stream for the Monitor tool
+  watch <name> [--verbose] [--from-start]  long poll: events since the last watch returned, else wait
   notify MESSAGE                           (for Codex) interim message to the coordinator
   roles                rm <name> [--force]
 `;
