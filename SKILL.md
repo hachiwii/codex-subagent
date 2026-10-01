@@ -58,5 +58,6 @@ When the notification arrives, `Read` the output file and relay what matters; do
 ## Notes
 
 - Codex binary: `$CODEX_BIN`, else the ChatGPT app's bundled CLI, else `codex` on PATH. State: `~/.claude/codex-subagents/<name>/`.
+- `--worktree` branches from the HEAD of the directory `start` runs in: `cd` to the main checkout first, not into another agent's worktree.
 - Names: a-z, 0-9, `-`, ≤40 chars; unique across sessions (`CS rm N` frees a name; it keeps a worktree that has changes).
 - TaskStop sends SIGTERM to the task's process group and SIGKILL ~1.5 s later; the host records the stop immediately and app-server, in the same group, stops the turn and its commands.
