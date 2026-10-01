@@ -79,8 +79,13 @@ function readJson(file) {
 }
 function writeJsonAtomic(file, data) {
   const tmp = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, `${JSON.stringify(data, null, 2)}\n`);
-  fs.renameSync(tmp, file);
+  try {
+    fs.writeFileSync(tmp, `${JSON.stringify(data, null, 2)}\n`);
+    fs.renameSync(tmp, file);
+  } catch (e) {
+    fs.rmSync(tmp, { force: true });
+    throw e;
+  }
 }
 function git(cwd, ...args) {
   const r = spawnSync("git", ["-C", cwd, ...args], { encoding: "utf8" });
@@ -569,6 +574,7 @@ class Host {
     const a = this.a;
     this.done = new Promise((r) => (this.resolveDone = r));
     for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"]) process.on(sig, () => this.onSignal(sig));
+    for (const ev of ["uncaughtException", "unhandledRejection"]) process.on(ev, (e) => this.crash(e));
     if (a.worktree) ensureWorktree(a);
     a.status = "starting";
     a.hostPid = process.pid;
@@ -879,6 +885,37 @@ class Host {
     this.finish("stopped");
   }
 
+  // An error nothing handled, for example a log write on a full disk. Record as much of the failure as can
+  // still be written — every step may fail for the same reason — then exit.
+  crash(e) {
+    if (this.crashing) process.exit(1);
+    this.crashing = true;
+    const attempt = (fn) => {
+      try {
+        fn();
+      } catch {}
+    };
+    const message = `host crashed: ${e?.message ?? e}`;
+    attempt(() => process.stderr.write(`${e?.stack ?? e}\n`));
+    if (!this.finishing) {
+      this.finishing = true;
+      const a = this.a;
+      if (this.turnActive) {
+        a.turns.push({ id: this.turnId, startedAt: new Date(this.turnStartedAt).toISOString(), endedAt: now(), status: "failed", durationMs: Date.now() - this.turnStartedAt, error: message });
+      }
+      a.status = "failed";
+      a.hostPid = null;
+      attempt(() => saveAgent(a));
+      attempt(() => note(a, "error", `! ${oneLine(message, 1000)}`));
+      attempt(() => note(a, "host-exit", "□ host exited (failed)"));
+      attempt(() => this.out(`\n━━ codex-subagent ${a.name} · failed ━━\n${message}`));
+    }
+    attempt(() => fs.rmSync(this.p.sock, { force: true }));
+    attempt(() => releaseLock(this.a));
+    attempt(() => this.server?.close());
+    process.exit(1);
+  }
+
   fail(message) {
     if (this.finishing) return;
     this.errorText = message;
@@ -1144,6 +1181,7 @@ async function cmdStatus(argv) {
   if (a.remote) lines.push(`remote:      Codex Cloud task ${a.remote.taskId ?? "?"} (env ${a.remote.env})`);
   lines.push(
     `turns:       ${a.turns.map((t) => `${t.status} ${fmtDur(t.durationMs)}`).join(", ") || "-"}`,
+    ...(a.turns.at(-1)?.error ? [`last error:  ${oneLine(a.turns.at(-1).error, 400)}`] : []),
     `usage:       ${a.usage ? `${a.usage.totalTokens} tokens` : "-"}`,
     `created:     ${a.createdAt} (${ago(a.createdAt)})`,
     `files:       ${p.dir}`,
