@@ -201,19 +201,31 @@ function migrateFlatLayout() {
     }
   }
 }
-// "name" is the subagent of this session, else the only one of that name in any session;
-// "<session id prefix>/name" picks one explicitly.
+// "name" is a subagent of this session; "<session id prefix>/name" is one of another session. A subagent
+// still in the flat layout, where names were global, also answers to its bare name from any session.
 function loadAgent(addr) {
   if (!addr) die("missing subagent name");
   const slash = addr.lastIndexOf("/");
   const [prefix, name] = slash >= 0 ? [addr.slice(0, slash), addr.slice(slash + 1)] : [null, addr];
   const sid = (a) => a.sessionId ?? NO_SESSION;
+  const label = (a) => `${sid(a).slice(0, 8)}/${a.name}`;
   const named = allAgents().filter((a) => a.name === name);
-  let hits = prefix === null ? named.filter((a) => sid(a) === (SESSION ?? NO_SESSION)) : named.filter((a) => sid(a).startsWith(prefix));
-  if (!hits.length && prefix === null) hits = named;
+  let hits;
+  if (prefix === null) {
+    hits = named.filter((a) => sid(a) === (SESSION ?? NO_SESSION));
+    if (!hits.length) hits = named.filter((a) => isFlatDir(a.dir));
+  } else {
+    if (!prefix) die(`"${addr}": the session id prefix is empty`);
+    hits = named.filter((a) => sid(a).startsWith(prefix));
+  }
   if (hits.length === 1) return hits[0];
-  if (!hits.length) die(`no codex subagent named "${addr}" (see: list --all)`);
-  die(`"${addr}" matches several subagents; use one of: ${hits.map((a) => `${sid(a).slice(0, 8)}/${a.name}`).join(", ")}`);
+  if (hits.length > 1) die(`"${addr}" matches several subagents; use one of: ${hits.map(label).join(", ")}`);
+  if (prefix === null && named.length) die(`no codex subagent named "${name}" in this session; other sessions have: ${named.map(label).join(", ")}`);
+  die(`no codex subagent named "${addr}"`);
+}
+// The same subagent after a flat directory may have been moved to its session.
+function reloadAgent(a) {
+  return readAgent(a.dir) ?? readAgent(path.join(sessionDir(a.sessionId), a.name)) ?? die(`${a.name} is gone`, 1);
 }
 function saveAgent(a) {
   a.updatedAt = now();
@@ -1038,7 +1050,7 @@ async function cmdSend(argv) {
   // No host (or it is finishing): become the host and continue the thread in a new turn.
   for (let i = 0; i < 150 && hostAlive(a.dir); i++) await sleep(200);
   migrateFlatLayout(); // a host that just left a flat directory frees it to be moved
-  const fresh = loadAgent(addr);
+  const fresh = reloadAgent(a);
   if (!(await acquireLock(fresh, 30_000))) die(`${name} has a host that does not respond; try again or stop it`, 1);
   if (newPerms) {
     const mode = opts.mode ?? fresh.mode ?? null;
@@ -1057,7 +1069,7 @@ async function cmdStop(argv) {
   const r = await control(a, { op: "stop", reason: "stop command" });
   if (!r?.ok) return console.log(`${name} is not running (${liveStatus(a, null)})`);
   for (let i = 0; i < 60 && fs.existsSync(paths(a.dir).lock); i++) await sleep(250);
-  console.log(`${name}: ${readAgent(a.dir).status}`);
+  console.log(`${name}: ${reloadAgent(a).status}`);
 }
 
 async function cmdAnswer(verb, argv) {
@@ -1085,14 +1097,13 @@ function table(rows) {
 }
 
 async function cmdList(argv) {
-  const { opts } = parseArgs(argv, { flags: ["all", "json"] });
-  const agents = allAgents().filter((a) => opts.all || !SESSION || a.sessionId === SESSION);
+  const { opts } = parseArgs(argv, { flags: ["json"] });
+  const agents = allAgents().filter((a) => (a.sessionId ?? null) === SESSION);
   const rows = [];
   for (const a of agents) {
     const ping = a.hostPid ? await control(a, { op: "ping" }, 1500) : null;
     const status = liveStatus(a, ping);
     rows.push({
-      session: a.sessionId ?? NO_SESSION,
       name: a.name,
       status,
       role: a.role ?? "-",
@@ -1104,12 +1115,11 @@ async function cmdList(argv) {
     });
   }
   if (opts.json) return console.log(JSON.stringify(rows, null, 2));
-  if (!rows.length) return console.log(opts.all ? "no codex subagents" : "no codex subagents in this session (list --all shows every session)");
-  const session = opts.all ? [["SESSION"], (r) => [r.session.slice(0, 8)]] : [[], () => []];
+  if (!rows.length) return console.log("no codex subagents in this session");
   console.log(
     table([
-      [...session[0], "NAME", "STATUS", "ROLE", "TURNS", "STARTED", "LAST ACTIVITY", "WHERE", "DESCRIPTION"],
-      ...rows.map((r) => [...session[1](r), r.name, r.status, r.role, r.turns, r.started, r.lastActivity, r.where, r.description]),
+      ["NAME", "STATUS", "ROLE", "TURNS", "STARTED", "LAST ACTIVITY", "WHERE", "DESCRIPTION"],
+      ...rows.map((r) => [r.name, r.status, r.role, r.turns, r.started, r.lastActivity, r.where, r.description]),
     ]),
   );
 }
@@ -1252,9 +1262,8 @@ const USAGE = `codex-subagent — Codex threads as Claude Code subagents
   stop <name>                              interrupt the running turn
   approve <name> <n> [--session]           grant approval request n (--session: also similar later ones)
   deny <name> <n> [--reason TEXT] [--cancel]   refuse it; the reason is passed to Codex (--cancel: also interrupt)
-  list [--all] [--json]                    subagents of this Claude session (or all)
-  <name> is a subagent of this session, else the only one of that name anywhere;
-  <session id prefix>/<name> picks one of another session.
+  list [--json]                            subagents of this Claude session
+  <name> is a subagent of this session; <session id prefix>/<name> is one of another session.
   status <name>        log <name> [-n N]        result <name>        transcript <name>
   watch <name> [--verbose] [--from-start]  event stream for the Monitor tool
   notify MESSAGE                           (for Codex) interim message to the coordinator
