@@ -24,7 +24,7 @@ Each subagent is one Codex thread. While a turn runs, a **host process** owns it
 | subagents belong to the session that spawned them | names are per Claude session; `N` is this session's subagent only; another session's must be addressed explicitly as `<session id prefix>/N` |
 | `TaskStop` | `TaskStop` on the host task, or `CS stop N` |
 | agent transcript / output file | `CS log N` (progress), `CS result N` (last final message), `CS status N`, `CS transcript N` (raw app-server events) |
-| subagent `SendMessage` to main | Codex runs `CS notify "…"`; arm `Monitor` on `CS watch N` to be notified at once (Monitor expires after ≤30 min: re-arm; a re-armed watch repeats approval requests still waiting). Otherwise they appear in the turn report |
+| subagent `SendMessage` to main | Codex runs `CS notify "…"`; arm `Monitor` on `CS watch N` to be notified at once. `watch` begins with the events no earlier watch has shown, so nothing is lost when it is attached late or re-armed after the Monitor expired (≤30 min); it also repeats approval requests that are still waiting. Otherwise the messages appear in the turn report |
 | `.claude/agents/*.md` agent types | roles: `<repo>/.claude/codex-agents/*.md`, `~/.claude/codex-agents/*.md`, built-in `roles/` (`CS roles` lists them) |
 | `isolation: "worktree"` (auto-removed if unchanged) | `--worktree` or `isolation: worktree` in the role: `<repo>/.claude/worktrees/codex-N` on branch `worktree-codex-N`; removed after a turn that changed nothing, recreated on the next `send` |
 | `isolation: "remote"` | `--remote --env ENV_ID [--branch B]` → Codex Cloud task, polled until done, diff in the report. Codex Cloud cannot steer, continue or cancel: `send` is refused, `stop` only stops watching |

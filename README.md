@@ -65,7 +65,7 @@ approve <name> <n>           grant approval request n
 deny <name> <n> --reason …   refuse it; Codex gets the reason
 list                         subagents of this Claude session
 status | log | result | transcript <name>
-watch <name>                 event stream for Claude's Monitor tool
+watch <name>                 event stream for Claude's Monitor tool; begins with events not shown yet
 roles                        available roles
 rm <name>                    delete a subagent's state
 ```
@@ -159,7 +159,7 @@ approve <名字> <编号>        批准第 n 条审批请求
 deny <名字> <编号> --reason … 拒绝，理由会传给 Codex
 list                         当前 Claude 会话的 subagent
 status | log | result | transcript <名字>
-watch <名字>                 事件流，配合 Claude 的 Monitor 工具使用
+watch <名字>                 事件流，配合 Claude 的 Monitor 工具使用；从还没输出过的事件开始
 roles                        可用的角色
 rm <名字>                    删除一个 subagent 的状态
 ```

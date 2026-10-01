@@ -160,6 +160,7 @@ function paths(dir) {
     result: path.join(dir, "result.md"),
     serverLog: path.join(dir, "app-server.log"),
     prompts: path.join(dir, "prompts"),
+    cursor: path.join(dir, "watch.json"),
   };
 }
 // An agent carries the directory it was read from; it is not part of agent.json.
@@ -1211,7 +1212,9 @@ function cmdTranscript(argv) {
   console.log(paths(loadAgent(parseArgs(argv).pos[0]).dir).transcript);
 }
 
-// For the Monitor tool: one line per event worth interrupting the coordinator for; exits with the host.
+// For the Monitor tool: one line per event worth interrupting the coordinator for. It begins with the
+// events no earlier watch has shown (the position is kept per subagent), then follows the host and ends
+// when the host exits.
 async function cmdWatch(argv) {
   const { opts, pos } = parseArgs(argv, { flags: ["verbose", "from-start"] });
   const a = loadAgent(pos[0]);
@@ -1219,32 +1222,42 @@ async function cmdWatch(argv) {
   const p = paths(a.dir);
   const kinds = new Set(["to-main", "question", "approval", "error", "turn-end", "host-exit"]);
   if (opts.verbose) for (const k of ["commentary", "command", "file", "tool", "steer", "turn-start", "approval-answer"]) kinds.add(k);
-  if (!opts["from-start"]) {
-    const pend = await control(a, { op: "pending" }, 1500);
-    for (const r of pend?.pending ?? []) console.log(`[${name}] ⚠ approval #${r.id} (still waiting) — ${r.text} → answer: approve ${name} ${r.id} | deny ${name} ${r.id} --reason "…"`);
-  }
-  let offset = opts["from-start"] || !fs.existsSync(p.events) ? 0 : fs.statSync(p.events).size;
-  let idle = 0;
-  for (;;) {
+  let offset = opts["from-start"] ? 0 : (readJson(p.cursor)?.offset ?? 0);
+  let last = null; // kind of the most recent event read
+  const readNew = () => {
     const size = fs.existsSync(p.events) ? fs.statSync(p.events).size : 0;
-    if (size > offset) {
-      const fd = fs.openSync(p.events, "r");
-      const buf = Buffer.alloc(size - offset);
-      fs.readSync(fd, buf, 0, buf.length, offset);
-      fs.closeSync(fd);
-      const text = buf.toString("utf8");
-      const complete = text.lastIndexOf("\n") + 1;
-      offset += Buffer.byteLength(text.slice(0, complete));
-      for (const line of text.slice(0, complete).split("\n").filter(Boolean)) {
-        const ev = JSON.parse(line);
-        if (kinds.has(ev.kind)) console.log(`[${name}] ${ev.text}`);
-        if (ev.kind === "host-exit") return;
-      }
-      idle = 0;
-    } else if (!fs.existsSync(p.lock) && ++idle > 20) {
-      return console.log(`[${name}] not running (${readAgent(a.dir)?.status ?? "removed"})`);
-    }
+    if (size <= offset) return [];
+    const fd = fs.openSync(p.events, "r");
+    const buf = Buffer.alloc(size - offset);
+    fs.readSync(fd, buf, 0, buf.length, offset);
+    fs.closeSync(fd);
+    const complete = buf.subarray(0, buf.lastIndexOf(0x0a) + 1);
+    if (!complete.length) return [];
+    const events = complete.toString("utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
+    for (const ev of events) if (kinds.has(ev.kind)) console.log(`[${name}] ${ev.text}`);
+    offset += complete.length;
+    writeJsonAtomic(p.cursor, { offset });
+    last = events.at(-1).kind;
+    return events;
+  };
+
+  const backlog = readNew();
+  // A request an earlier watch already showed and nobody answered yet is repeated.
+  const pend = await control(a, { op: "pending" }, 1500);
+  for (const r of pend?.pending ?? []) {
+    if (backlog.some((ev) => ev.kind === "approval" && ev.text.startsWith(`⚠ approval #${r.id} `))) continue;
+    console.log(`[${name}] ⚠ approval #${r.id} (still waiting) — ${r.text} → answer: approve ${name} ${r.id} | deny ${name} ${r.id} --reason "…"`);
+  }
+  for (let idle = 0; ; ) {
     await sleep(500);
+    if (readNew().length) {
+      if (last === "host-exit") return;
+      idle = 0;
+    } else if (!hostAlive(a.dir) && ++idle > 20) {
+      // No host for 10 s: nothing to follow. Say so unless the backlog already ended with the host's exit.
+      if (last !== "host-exit") console.log(`[${name}] not running (${readAgent(a.dir)?.status ?? "removed"})`);
+      return;
+    }
   }
 }
 
@@ -1303,7 +1316,7 @@ const USAGE = `codex-subagent — Codex threads as Claude Code subagents
   list [--json]                            subagents of this Claude session
   <name> is a subagent of this session; <session id prefix>/<name> is one of another session.
   status <name>        log <name> [-n N]        result <name>        transcript <name>
-  watch <name> [--verbose] [--from-start]  event stream for the Monitor tool
+  watch <name> [--verbose] [--from-start]  event stream for the Monitor tool; begins with events no watch has shown yet
   notify MESSAGE                           (for Codex) interim message to the coordinator
   roles                rm <name> [--force]
 `;
