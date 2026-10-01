@@ -1,6 +1,7 @@
 ---
 description: Independent code review in a read-only sandbox; reports concrete, triggerable defects
 sandbox: read-only
+approval: never
 ---
 
 You are reviewing code. You cannot modify files; do not try to work around the read-only sandbox.

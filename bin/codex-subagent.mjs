@@ -23,7 +23,25 @@ const APP_CODEX = "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexC
 const SESSION = process.env.CLAUDE_CODE_SESSION_ID ?? null;
 const TO_MAIN = "[[codex-subagent:to-main]]";
 const NAME_RE = /^[a-z0-9][a-z0-9-]{0,39}$/;
-const SANDBOXES = ["read-only", "workspace-write", "danger-full-access"];
+const SANDBOXES = ["read-only", "workspace-write", "danger-full-access"]; // narrowest first
+const APPROVALS = ["untrusted", "on-request", "never"];
+// Claude Code permission mode → the closest Codex sandbox and approval policy.
+const MODES = {
+  bypassPermissions: { sandbox: "danger-full-access", approval: "never" },
+  auto: { sandbox: "workspace-write", approval: "on-request" },
+  acceptEdits: { sandbox: "workspace-write", approval: "on-request" },
+  default: { sandbox: "read-only", approval: "on-request" },
+  plan: { sandbox: "read-only", approval: "never" },
+  dontAsk: { sandbox: "read-only", approval: "never" },
+};
+MODES.manual = MODES.default;
+const APPROVAL_METHODS = new Set([
+  "item/commandExecution/requestApproval",
+  "item/fileChange/requestApproval",
+  "item/permissions/requestApproval",
+  "execCommandApproval",
+  "applyPatchApproval",
+]);
 const EXIT = { completed: 0, failed: 1, stopped: 0 }; // a stop is requested, not a failure
 const NO_USER_ANSWER =
   "No interactive user is available. Decide yourself if you reasonably can and say what you assumed; " +
@@ -249,14 +267,71 @@ function claudeAgentBody(name, repoRoot) {
   }
   die(`extends: Claude agent "${name}" not found`);
 }
-function baseInstructions(name) {
+function baseInstructions(name, approval) {
   return [
     `You are running as a subagent named "${name}" of a Claude Code session (the coordinator).`,
     "- The final message of each turn is delivered verbatim to the coordinator as your report. Make it self-contained.",
     "- There is no interactive user. Do not wait for answers mid-turn. If you need a decision you cannot make yourself, finish the turn and state the question in your final message; the coordinator replies in a new turn.",
     "- Messages from the coordinator may be inserted while you work. Treat them as updated instructions.",
     `- To send the coordinator an interim message without ending the turn (an important finding, a blocker you are working around), run: node ${SELF} notify "<message>". Use it sparingly.`,
-  ].join("\n");
+    approval !== "never" &&
+      "- Actions your sandbox does not allow need the coordinator's approval. Request them with a specific justification instead of working around the sandbox; a denial may come with a reason — follow it.",
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+// ---------- permissions ----------
+
+// Flags win. Otherwise a role may narrow what the mode allows, never widen it.
+function resolvePermissions(mode, rolePerms, opts) {
+  if (mode && !MODES[mode]) die(`--mode must be one of ${Object.keys(MODES).join(", ")}`);
+  const m = mode ? MODES[mode] : null;
+  const narrower = (x, y) => (!x ? y : !y ? x : SANDBOXES.indexOf(x) <= SANDBOXES.indexOf(y) ? x : y);
+  const sandbox = opts.sandbox ?? narrower(rolePerms?.sandbox, m?.sandbox) ?? null;
+  const approval = opts.approval ?? rolePerms?.approval ?? m?.approval ?? "never";
+  if (sandbox && !SANDBOXES.includes(sandbox)) die(`sandbox must be one of ${SANDBOXES.join(", ")}`);
+  if (!APPROVALS.includes(approval)) die(`approval must be one of ${APPROVALS.join(", ")}`);
+  return { sandbox, approval };
+}
+
+// What Codex is asking for, in one line. `items` holds the fileChange items seen so far.
+function describeApproval(method, p, items) {
+  const why = p.reason ? ` · reason: ${oneLine(p.reason, 300)}` : "";
+  switch (method) {
+    case "item/commandExecution/requestApproval": {
+      const net = p.networkApprovalContext?.host ? ` · network: ${p.networkApprovalContext.host}` : "";
+      return `command \`${oneLine(p.command, 400)}\` in ${p.cwd ?? "?"}${net}${why}`;
+    }
+    case "execCommandApproval":
+      return `command \`${oneLine([].concat(p.command ?? []).join(" "), 400)}\` in ${p.cwd ?? "?"}${why}`;
+    case "item/fileChange/requestApproval": {
+      const changes = items.get(p.itemId)?.changes ?? [];
+      const files = changes.map((c) => `${c.kind?.type ?? "change"} ${c.path}`).join(", ") || "(files not reported)";
+      return `file changes: ${oneLine(files, 600)}${p.grantRoot ? ` · write access under ${p.grantRoot}` : ""}${why}`;
+    }
+    case "applyPatchApproval":
+      return `file changes: ${oneLine(Object.keys(p.fileChanges ?? {}).join(", "), 600)}${p.grantRoot ? ` · write access under ${p.grantRoot}` : ""}${why}`;
+    case "item/permissions/requestApproval":
+      return `additional permissions ${JSON.stringify(p.permissions)} in ${p.cwd}${why}`;
+  }
+  return method;
+}
+
+// decision: approve | approve-session | deny | cancel (deny and interrupt the turn)
+function approvalResponse(method, p, decision) {
+  switch (method) {
+    case "item/commandExecution/requestApproval":
+    case "item/fileChange/requestApproval":
+      return { decision: { approve: "accept", "approve-session": "acceptForSession", deny: "decline", cancel: "cancel" }[decision] };
+    case "item/permissions/requestApproval":
+      return {
+        permissions: decision.startsWith("approve") ? p.permissions : {},
+        scope: decision === "approve-session" ? "session" : "turn",
+      };
+    default:
+      return { decision: { approve: "approved", "approve-session": "approved_for_session", deny: "denied", cancel: "abort" }[decision] };
+  }
 }
 
 // ---------- worktree isolation ----------
@@ -355,7 +430,7 @@ class AppServer {
     }
     if (msg.id !== undefined && msg.method) {
       Promise.resolve()
-        .then(() => this.onRequest(msg.method, msg.params ?? {}))
+        .then(() => this.onRequest(msg.method, msg.params ?? {}, msg.id))
         .then(
           (result) => this.send({ id: msg.id, result }),
           (e) => this.send({ id: msg.id, error: { code: e.code ?? -32000, message: e.message } }),
@@ -390,6 +465,8 @@ class Host {
     this.finishing = false;
     this.stopReason = null;
     this.usage = null;
+    this.pending = new Map(); // approval requests waiting for the coordinator, by number
+    this.items = new Map(); // fileChange items, to describe what an approval is about
     this.resetTurn();
   }
   resetTurn() {
@@ -420,7 +497,7 @@ class Host {
     const env = { ...process.env, CODEX_SUBAGENT_NAME: a.name };
     this.server = new AppServer(a.cwd, env, this.p.serverLog);
     this.server.onNotification = (m, p) => this.onNotification(m, p);
-    this.server.onRequest = (m, p) => this.onRequest(m, p);
+    this.server.onRequest = (m, p, id) => this.onRequest(m, p, id);
     this.server.exited.then((err) => {
       if (!this.finishing) this.fail(`${err.message}; see ${this.p.serverLog}`);
     });
@@ -428,7 +505,7 @@ class Host {
     try {
       await this.server.request("initialize", { clientInfo: { name: "codex-subagent", title: "codex-subagent", version: "1" } });
       this.server.notify("initialized");
-      const common = { cwd: a.cwd, approvalPolicy: "never", sandbox: a.sandbox, model: a.model };
+      const common = { cwd: a.cwd, approvalPolicy: a.approval ?? "never", sandbox: a.sandbox, model: a.model };
       let res;
       if (resume) {
         res = await this.server.request("thread/resume", { threadId: a.threadId, ...common });
@@ -447,7 +524,7 @@ class Host {
       this.out(
         `codex-subagent ${a.name}: ${resume ? "resumed" : "started"} · thread ${a.threadId} · ` +
           `${a.actual.model}${a.effort ?? a.actual.effort ? `/${a.effort ?? a.actual.effort}` : ""} · ` +
-          `sandbox ${a.actual.sandbox ?? "default"} · ${a.cwd}`,
+          `sandbox ${a.actual.sandbox ?? "default"} · approval ${a.approval ?? "never"} · ${a.cwd}`,
       );
       await this.startTurn(text, resume ? "message" : "task");
     } catch (e) {
@@ -474,8 +551,11 @@ class Host {
   }
 
   async handleControl(req) {
-    if (req.op === "ping") return { ok: true, status: this.a.status, turnActive: this.turnActive, pid: process.pid };
+    const pending = [...this.pending.values()].map((r) => ({ id: r.id, text: r.text }));
+    if (req.op === "ping") return { ok: true, status: this.a.status, turnActive: this.turnActive, pid: process.pid, pending: pending.length };
+    if (req.op === "pending") return { ok: true, pending };
     if (this.finishing) return { ok: false, error: "finishing" };
+    if (req.op === "answer") return this.answer(req);
     if (req.op === "stop") {
       this.requestStop(req.reason ?? "stop command");
       return { ok: true };
@@ -499,6 +579,21 @@ class Host {
       return { ok: true, mode: "queued" };
     }
     return { ok: false, error: `unknown op ${req.op}` };
+  }
+
+  async answer({ id, decision, reason }) {
+    const r = this.pending.get(Number(id));
+    if (!r) return { ok: false, error: `no pending approval #${id} (already answered, or the turn moved on)` };
+    this.pending.delete(r.id);
+    r.resolve(approvalResponse(r.method, r.params, decision));
+    this.note("approval-answer", `${decision.startsWith("approve") ? "✓" : "✗"} approval #${r.id} ${decision}${reason ? `: ${oneLine(reason, 300)}` : ""}`);
+    if (reason && decision === "deny" && this.turnActive) {
+      const text = `The coordinator denied your request (${r.text}). Reason: ${reason}`;
+      await this.server
+        .request("turn/steer", { threadId: this.a.threadId, expectedTurnId: this.turnId, input: textInput(text) })
+        .catch((e) => this.note("error", `! could not deliver the denial reason: ${oneLine(e.message, 200)}`));
+    }
+    return { ok: true };
   }
 
   async startTurn(text, label) {
@@ -533,8 +628,18 @@ class Host {
       case "turn/started":
         if (mine && !this.turnId) this.turnId = p.turn.id;
         break;
+      case "item/started":
+        if (p.item?.type === "fileChange") this.items.set(p.item.id, p.item);
+        break;
       case "item/completed":
         if (mine) this.onItem(p.item);
+        break;
+      case "serverRequest/resolved":
+        for (const r of this.pending.values()) {
+          if (r.rpcId !== p.requestId) continue;
+          this.pending.delete(r.id);
+          this.note("approval", `· approval #${r.id} is no longer needed (resolved by Codex)`);
+        }
         break;
       case "thread/tokenUsage/updated":
         if (mine) this.usage = p.tokenUsage.total;
@@ -585,7 +690,7 @@ class Host {
     }
   }
 
-  async onRequest(method, p) {
+  async onRequest(method, p, rpcId) {
     if (method === "item/tool/requestUserInput") {
       const qs = p.questions ?? [];
       for (const q of qs) {
@@ -594,16 +699,14 @@ class Host {
       }
       return { answers: Object.fromEntries(qs.map((q) => [q.id, { answers: [NO_USER_ANSWER] }])) };
     }
-    const declined = {
-      "item/commandExecution/requestApproval": { decision: "decline" },
-      "item/fileChange/requestApproval": { decision: "decline" },
-      execCommandApproval: { decision: "denied" },
-      applyPatchApproval: { decision: "denied" },
-    }[method];
-    if (declined) {
-      // approvalPolicy is "never", so this should not happen; record it if it does.
-      this.note("error", `! unexpected approval request ${method}; declined`);
-      return declined;
+    if (APPROVAL_METHODS.has(method)) {
+      const id = (this.a.approvalSeq = (this.a.approvalSeq ?? 0) + 1);
+      saveAgent(this.a);
+      const text = describeApproval(method, p, this.items);
+      return new Promise((resolve) => {
+        this.pending.set(id, { id, rpcId, method, params: p, text, resolve });
+        this.note("approval", `⚠ approval #${id} — ${text} → answer: approve ${this.a.name} ${id} | deny ${this.a.name} ${id} --reason "…"`);
+      });
     }
     throw Object.assign(new Error(`codex-subagent does not handle ${method}`), { code: -32601 });
   }
@@ -624,6 +727,7 @@ class Host {
     });
     const final = this.finalText ?? this.lastText;
     fs.writeFileSync(this.p.result, final ?? "");
+    this.pending.clear();
     this.note("turn-end", `■ turn ${a.turns.length} ${status}${errorText ? `: ${oneLine(errorText, 200)}` : ""}`);
     const continuing = status === "completed" && this.nextTurn.length > 0 && !this.stopReason;
     if (!continuing && a.worktree) cleanupWorktreeIfUnchanged(a);
@@ -783,7 +887,7 @@ function autoName(hint) {
 
 async function cmdStart(argv) {
   const { opts, pos } = parseArgs(argv, {
-    values: ["name", "description", "role", "cwd", "sandbox", "model", "effort", "file", "env", "branch"],
+    values: ["name", "description", "role", "cwd", "mode", "sandbox", "approval", "model", "effort", "file", "env", "branch"],
     flags: ["worktree", "remote"],
   });
   const text = readText(pos, opts.file).trim();
@@ -794,8 +898,8 @@ async function cmdStart(argv) {
   const role = opts.role ? loadRole(opts.role, repoRoot) : null;
   const name = opts.name ?? autoName(opts.description ?? role?.name ?? "codex");
   if (!NAME_RE.test(name)) die(`invalid name "${name}": use a-z, 0-9 and "-", at most 40 characters`);
-  const sandbox = opts.sandbox ?? role?.meta.sandbox ?? null;
-  if (sandbox && !SANDBOXES.includes(sandbox)) die(`--sandbox must be one of ${SANDBOXES.join(", ")}`);
+  const rolePerms = { sandbox: role?.meta.sandbox ?? null, approval: role?.meta.approval ?? null };
+  const perms = resolvePermissions(opts.mode, rolePerms, opts);
   const wantWorktree = Boolean(opts.worktree) || role?.meta.isolation === "worktree";
   if (wantWorktree && !repoRoot) die("--worktree needs a git repository");
   if (opts.remote && !opts.env) die("--remote needs --env <Codex Cloud environment id>");
@@ -810,7 +914,7 @@ async function cmdStart(argv) {
   }
   fs.mkdirSync(p.prompts);
   const instructions = [
-    baseInstructions(name),
+    baseInstructions(name, perms.approval),
     role?.meta.extends && claudeAgentBody(role.meta.extends, repoRoot),
     role?.body,
   ].filter(Boolean);
@@ -820,7 +924,9 @@ async function cmdStart(argv) {
     role: role?.name ?? null,
     cwd,
     repoRoot,
-    sandbox,
+    mode: opts.mode ?? null,
+    rolePerms,
+    ...perms,
     model: opts.model ?? role?.meta.model ?? null,
     effort: opts.effort ?? role?.meta.effort ?? null,
     developerInstructions: instructions.join("\n\n"),
@@ -841,11 +947,12 @@ async function cmdStart(argv) {
 }
 
 async function cmdSend(argv) {
-  const { opts, pos } = parseArgs(argv, { values: ["file"] });
+  const { opts, pos } = parseArgs(argv, { values: ["file", "mode", "sandbox", "approval"] });
   const [name, ...words] = pos;
   const a = loadAgent(name);
   const text = readText(words, opts.file).trim();
   if (!text) die("empty message");
+  const newPerms = opts.mode || opts.sandbox || opts.approval;
   if (a.remote) die("remote (Codex Cloud) subagents cannot take messages: Codex Cloud cannot steer or continue a task");
   const r = await control(name, { op: "send", text }, 30_000);
   if (r?.ok) {
@@ -854,11 +961,17 @@ async function cmdSend(argv) {
         ? `delivered to ${name}: inserted into its running turn`
         : `queued for ${name}: it starts a new turn with this message when the current one ends`,
     );
+    if (newPerms) console.log("permissions unchanged: --mode/--sandbox/--approval only apply when send starts a new turn of an idle subagent");
     return;
   }
   // No host (or it is finishing): become the host and continue the thread in a new turn.
   if (!(await acquireLock(name, 30_000))) die(`${name} has a host that does not respond; try again or stop it`, 1);
-  return new Host(loadAgent(name)).run(text, { resume: true });
+  const fresh = loadAgent(name);
+  if (newPerms) {
+    const mode = opts.mode ?? fresh.mode ?? null;
+    Object.assign(fresh, { mode }, resolvePermissions(mode, fresh.rolePerms, opts));
+  }
+  return new Host(fresh).run(text, { resume: true });
 }
 
 async function cmdStop(argv) {
@@ -874,7 +987,20 @@ async function cmdStop(argv) {
   console.log(`${name}: ${loadAgent(name).status}`);
 }
 
+async function cmdAnswer(verb, argv) {
+  const { opts, pos } = parseArgs(argv, { values: ["reason"], flags: ["session", "cancel"] });
+  const [name, id] = pos;
+  loadAgent(name);
+  if (!id) die(`usage: ${verb} <name> <approval number>`);
+  const decision = verb === "approve" ? (opts.session ? "approve-session" : "approve") : opts.cancel ? "cancel" : "deny";
+  const r = await control(name, { op: "answer", id, decision, reason: opts.reason }, 20_000);
+  if (!r) die(`${name} is not running`, 1);
+  if (!r.ok) die(r.error, 1);
+  console.log(`${name}: approval #${id} → ${decision}`);
+}
+
 function liveStatus(a, ping) {
+  if (ping?.ok && ping.pending) return `needs approval (${ping.pending})`;
   if (ping?.ok) return ping.turnActive ? "running" : "starting";
   if (["running", "starting"].includes(a.status)) return a.hostPid && pidAlive(a.hostPid) ? a.status : "stopped (host gone)";
   return a.status;
@@ -896,7 +1022,7 @@ async function cmdList(argv) {
       name: a.name,
       status,
       role: a.role ?? "-",
-      turns: a.turns.length + (status === "running" ? 1 : 0),
+      turns: a.turns.length + (/^(running|needs approval)/.test(status) ? 1 : 0),
       started: ago(a.createdAt),
       lastActivity: ago(a.lastActivityAt ?? a.updatedAt),
       where: a.remote ? `cloud:${a.remote.taskId ?? "?"}` : a.worktree && !a.worktree.removed ? a.worktree.path : a.cwd,
@@ -923,9 +1049,12 @@ async function cmdStatus(argv) {
     `status:      ${liveStatus(a, ping)}${a.hostPid ? ` (host pid ${a.hostPid})` : ""}`,
     `role:        ${a.role ?? "-"}`,
     `thread:      ${a.threadId ?? "-"}`,
-    `model:       ${a.actual?.model ?? a.model ?? "default"} / effort ${a.effort ?? a.actual?.effort ?? "default"} / sandbox ${a.actual?.sandbox ?? a.sandbox ?? "default"}`,
+    `model:       ${a.actual?.model ?? a.model ?? "default"} / effort ${a.effort ?? a.actual?.effort ?? "default"}`,
+    `permissions: mode ${a.mode ?? "-"} → sandbox ${a.actual?.sandbox ?? a.sandbox ?? "default"}, approval ${a.approval ?? "never"}`,
     `cwd:         ${a.cwd}`,
   ];
+  const pend = ping?.pending ? await control(name, { op: "pending" }, 1500) : null;
+  for (const r of pend?.pending ?? []) lines.push(`pending:     #${r.id} ${r.text}`);
   if (a.worktree) lines.push(`worktree:    ${worktreeSummary(a.worktree)}`);
   if (a.remote) lines.push(`remote:      Codex Cloud task ${a.remote.taskId ?? "?"} (env ${a.remote.env})`);
   lines.push(
@@ -970,8 +1099,12 @@ async function cmdWatch(argv) {
   const name = pos[0];
   loadAgent(name);
   const p = paths(name);
-  const kinds = new Set(["to-main", "question", "error", "turn-end", "host-exit"]);
-  if (opts.verbose) for (const k of ["commentary", "command", "file", "tool", "steer", "turn-start"]) kinds.add(k);
+  const kinds = new Set(["to-main", "question", "approval", "error", "turn-end", "host-exit"]);
+  if (opts.verbose) for (const k of ["commentary", "command", "file", "tool", "steer", "turn-start", "approval-answer"]) kinds.add(k);
+  if (!opts["from-start"]) {
+    const pend = await control(name, { op: "pending" }, 1500);
+    for (const r of pend?.pending ?? []) console.log(`[${name}] ⚠ approval #${r.id} (still waiting) — ${r.text} → answer: approve ${name} ${r.id} | deny ${name} ${r.id} --reason "…"`);
+  }
   let offset = opts["from-start"] || !fs.existsSync(p.events) ? 0 : fs.statSync(p.events).size;
   let idle = 0;
   for (;;) {
@@ -1039,10 +1172,14 @@ async function cmdRm(argv) {
 const USAGE = `codex-subagent — Codex threads as Claude Code subagents
 
   start [--name N] [--description D] [--role R] [--worktree] [--cwd DIR]
-        [--sandbox read-only|workspace-write|danger-full-access] [--model M] [--effort E]
+        [--mode bypassPermissions|auto|acceptEdits|default|plan|dontAsk]
+        [--sandbox read-only|workspace-write|danger-full-access] [--approval untrusted|on-request|never]
+        [--model M] [--effort E]
         [--remote --env ENV_ID [--branch B]]  [PROMPT | - | --file F]
-  send <name> [MESSAGE | - | --file F]     steer the running turn, or continue in a new turn
+  send <name> [--mode M] [MESSAGE | - | --file F]   steer the running turn, or continue in a new turn
   stop <name>                              interrupt the running turn
+  approve <name> <n> [--session]           grant approval request n (--session: also similar later ones)
+  deny <name> <n> [--reason TEXT] [--cancel]   refuse it; the reason is passed to Codex (--cancel: also interrupt)
   list [--all] [--json]                    subagents of this Claude session (or all)
   status <name>        log <name> [-n N]        result <name>        transcript <name>
   watch <name> [--verbose] [--from-start]  event stream for the Monitor tool
@@ -1054,6 +1191,8 @@ const commands = {
   start: cmdStart,
   send: cmdSend,
   stop: cmdStop,
+  approve: (argv) => cmdAnswer("approve", argv),
+  deny: (argv) => cmdAnswer("deny", argv),
   list: cmdList,
   status: cmdStatus,
   log: cmdLog,
