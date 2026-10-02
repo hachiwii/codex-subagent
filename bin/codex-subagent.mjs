@@ -21,7 +21,10 @@ const SKILL_DIR = path.resolve(path.dirname(SELF), "..");
 const HOME = process.env.CODEX_SUBAGENT_HOME ?? path.join(os.homedir(), ".claude", "codex-subagents");
 const APP_CODEX = "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex";
 const SESSION = process.env.CLAUDE_CODE_SESSION_ID ?? null;
+// `notify` prints this line; the host picks it out of the command's output. The id makes each message
+// deliverable once, however often the line shows up again (a log that captured it and is printed later).
 const TO_MAIN = "[[codex-subagent:to-main]]";
+const TO_MAIN_RE = /^\[\[codex-subagent:to-main\]\] #([0-9a-f]{12}) (.*)$/;
 const NAME_RE = /^[a-z0-9][a-z0-9-]{0,39}$/;
 const SANDBOXES = ["read-only", "workspace-write", "danger-full-access"]; // narrowest first
 const APPROVALS = ["untrusted", "on-request", "never"];
@@ -237,11 +240,23 @@ function saveAgent(a) {
   a.updatedAt = now();
   writeJsonAtomic(paths(a.dir).agent, a);
 }
-function note(a, kind, text) {
+function note(a, kind, text, extra = {}) {
   const p = paths(a.dir);
   const t = new Date();
   fs.appendFileSync(p.progress, `${t.toTimeString().slice(0, 8)} ${text}\n`);
-  fs.appendFileSync(p.events, `${JSON.stringify({ t: t.toISOString(), kind, text })}\n`);
+  fs.appendFileSync(p.events, `${JSON.stringify({ t: t.toISOString(), kind, text, ...extra })}\n`);
+}
+// Ids of the notify messages already delivered for this subagent, in any earlier turn or host.
+function deliveredNotifyIds(a) {
+  const ids = new Set();
+  const file = paths(a.dir).events;
+  if (!fs.existsSync(file)) return ids;
+  for (const line of fs.readFileSync(file, "utf8").split("\n")) {
+    if (!line.includes('"kind":"to-main"')) continue;
+    const id = JSON.parse(line).id;
+    if (id) ids.add(id);
+  }
+  return ids;
 }
 function savePrompt(a, label, text) {
   const dir = paths(a.dir).prompts;
@@ -280,8 +295,11 @@ function releaseLock(a) {
 
 // Request/response over the host's control socket; null when no host answers.
 function control(a, req, timeoutMs = 3000) {
+  return controlAt(paths(a.dir).sock, req, timeoutMs);
+}
+function controlAt(sockPath, req, timeoutMs) {
   return new Promise((resolve) => {
-    const sock = net.createConnection(paths(a.dir).sock);
+    const sock = net.createConnection(sockPath);
     let buf = "";
     const timer = setTimeout(() => {
       sock.destroy();
@@ -551,6 +569,8 @@ class Host {
     this.finishing = false;
     this.stopReason = null;
     this.usage = null;
+    this.notified = deliveredNotifyIds(agent);
+    this.outBuf = new Map(); // unfinished last line of each running command's output
     this.pending = new Map(); // approval requests waiting for the coordinator, by number
     this.items = new Map(); // fileChange items, to describe what an approval is about
     this.resetTurn();
@@ -564,8 +584,19 @@ class Host {
     this.errorText = null;
     this.turnStartedAt = Date.now();
   }
-  note(kind, text) {
-    note(this.a, kind, text);
+  note(kind, text, extra) {
+    note(this.a, kind, text, extra);
+  }
+  // A notify message is delivered the first time its id is seen, whichever way it arrives.
+  deliverNotify(id, text) {
+    if (this.notified.has(id)) return;
+    this.notified.add(id);
+    this.toMain.push(text);
+    this.note("to-main", `✉ ${text}`, { id });
+  }
+  scanOutputLine(line) {
+    const m = TO_MAIN_RE.exec(line.replace(/\r$/, ""));
+    if (m) this.deliverNotify(m[1], m[2]);
   }
   out(text) {
     process.stdout.write(`${text}\n`);
@@ -581,7 +612,7 @@ class Host {
     a.hostPid = process.pid;
     saveAgent(a);
 
-    const env = { ...process.env, CODEX_SUBAGENT_NAME: a.name };
+    const env = { ...process.env, CODEX_SUBAGENT_NAME: a.name, CODEX_SUBAGENT_SOCK: this.p.sock };
     this.server = new AppServer(a.cwd, env, this.p.serverLog);
     this.server.onNotification = (m, p) => this.onNotification(m, p);
     this.server.onRequest = (m, p, id) => this.onRequest(m, p, id);
@@ -642,6 +673,10 @@ class Host {
     const pending = [...this.pending.values()].map((r) => ({ id: r.id, text: r.text }));
     if (req.op === "ping") return { ok: true, status: this.a.status, turnActive: this.turnActive, pid: process.pid, pending: pending.length };
     if (req.op === "pending") return { ok: true, pending };
+    if (req.op === "notify") {
+      this.deliverNotify(req.id, req.text);
+      return { ok: true };
+    }
     if (this.finishing) return { ok: false, error: "finishing" };
     if (req.op === "answer") return this.answer(req);
     if (req.op === "stop") {
@@ -716,6 +751,14 @@ class Host {
       case "turn/started":
         if (mine && !this.turnId) this.turnId = p.turn.id;
         break;
+      case "item/commandExecution/outputDelta": {
+        // Deliver a notify as soon as it is printed, not when the command it is part of ends.
+        if (!mine) break;
+        const lines = ((this.outBuf.get(p.itemId) ?? "") + p.delta).split("\n");
+        this.outBuf.set(p.itemId, lines.pop());
+        for (const line of lines) this.scanOutputLine(line);
+        break;
+      }
       case "item/started":
         if (p.item?.type === "fileChange") this.items.set(p.item.id, p.item);
         break;
@@ -754,12 +797,8 @@ class Host {
         break;
       case "commandExecution": {
         this.note("command", `$ ${oneLine(item.command, 160)} → ${item.exitCode ?? item.status}`);
-        for (const line of String(item.aggregatedOutput ?? "").split("\n")) {
-          if (!line.startsWith(TO_MAIN)) continue;
-          const msg = line.slice(TO_MAIN.length).trim();
-          this.toMain.push(msg);
-          this.note("to-main", `✉ ${msg}`);
-        }
+        this.outBuf.delete(item.id);
+        for (const line of String(item.aggregatedOutput ?? "").split("\n")) this.scanOutputLine(line);
         break;
       }
       case "fileChange":
@@ -1261,11 +1300,15 @@ async function cmdWatch(argv) {
   }
 }
 
-// Called by Codex from inside its shell; the host picks the line out of the command output.
-function cmdNotify(argv) {
-  const text = readText(parseArgs(argv).pos).trim();
+// Called by Codex from inside its shell. The printed line is what gets out of a sandbox: the host finds it
+// in the command's output, as it is printed or — for output in a command's first instant, which app-server
+// does not stream — when the command ends. Where nothing blocks it, the host is also told directly, at once.
+async function cmdNotify(argv) {
+  const text = oneLine(readText(parseArgs(argv).pos), 2000);
   if (!text) die("empty message");
-  console.log(`${TO_MAIN} ${oneLine(text, 2000)}`);
+  const id = crypto.randomBytes(6).toString("hex");
+  console.log(`${TO_MAIN} #${id} ${text}`);
+  if (process.env.CODEX_SUBAGENT_SOCK) await controlAt(process.env.CODEX_SUBAGENT_SOCK, { op: "notify", id, text }, 2000);
 }
 
 function cmdRoles() {
