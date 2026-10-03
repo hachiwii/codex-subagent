@@ -491,7 +491,7 @@ function worktreeSummary(wt) {
 // ---------- codex app-server client ----------
 
 class AppServer {
-  constructor(cwd, env, logFile) {
+  constructor(cwd, env, logFile, extraArgs = []) {
     this.nextId = 1;
     this.pending = new Map();
     this.onNotification = () => {};
@@ -499,10 +499,7 @@ class AppServer {
       throw Object.assign(new Error(`codex-subagent does not handle ${method}`), { code: -32601 });
     };
     // Same process group as the host: TaskStop's SIGTERM/SIGKILL reaches app-server too.
-    // A Codex subagent does not spawn agents of its own: the coordinator decides who runs. agents.enabled is
-    // what removes the spawn_agent tools (the multi_agent feature flags do not); the override applies to this
-    // app-server process only, not to other Codex instances or the user's config.
-    this.proc = spawn(codexBin(), ["app-server", "-c", "agents.enabled=false"], { cwd, env, stdio: ["pipe", "pipe", "pipe"] });
+    this.proc = spawn(codexBin(), ["app-server", ...extraArgs], { cwd, env, stdio: ["pipe", "pipe", "pipe"] });
     this.proc.stderr.pipe(fs.createWriteStream(logFile, { flags: "a" }));
     this.exited = new Promise((resolve) => {
       const fail = (err) => {
@@ -616,7 +613,11 @@ class Host {
     saveAgent(a);
 
     const env = { ...process.env, CODEX_SUBAGENT_NAME: a.name, CODEX_SUBAGENT_SOCK: this.p.sock };
-    this.server = new AppServer(a.cwd, env, this.p.serverLog);
+    // Unless allowed, a Codex subagent does not spawn agents of its own: the coordinator decides who runs.
+    // agents.enabled is what removes the spawn_agent tools (the multi_agent feature flags do not); the
+    // override applies to this app-server process only, not to other Codex instances or the user's config.
+    const noSubagents = a.allowSubagents ? [] : ["-c", "agents.enabled=false"];
+    this.server = new AppServer(a.cwd, env, this.p.serverLog, noSubagents);
     this.server.onNotification = (m, p) => this.onNotification(m, p);
     this.server.onRequest = (m, p, id) => this.onRequest(m, p, id);
     this.server.exited.then((err) => {
@@ -645,7 +646,7 @@ class Host {
       this.out(
         `codex-subagent ${a.name}: ${resume ? "resumed" : "started"} · thread ${a.threadId} · ` +
           `${a.actual.model}${a.effort ?? a.actual.effort ? `/${a.effort ?? a.actual.effort}` : ""} · ` +
-          `sandbox ${a.actual.sandbox ?? "default"} · approval ${a.approval ?? "never"} · ${a.cwd}`,
+          `sandbox ${a.actual.sandbox ?? "default"} · approval ${a.approval ?? "never"}${a.allowSubagents ? " · may spawn sub-agents" : ""} · ${a.cwd}`,
       );
       await this.startTurn(text, resume ? "message" : "task");
     } catch (e) {
@@ -1049,7 +1050,7 @@ function autoName(hint) {
 async function cmdStart(argv) {
   const { opts, pos } = parseArgs(argv, {
     values: ["name", "description", "role", "cwd", "mode", "sandbox", "approval", "model", "effort", "file", "env", "branch"],
-    flags: ["worktree", "remote"],
+    flags: ["worktree", "remote", "allow-subagents"],
   });
   const text = readText(pos, opts.file).trim();
   if (!text) die("empty prompt: pass it as text, with --file, or on stdin");
@@ -1088,6 +1089,7 @@ async function cmdStart(argv) {
     cwd,
     repoRoot,
     mode: opts.mode ?? null,
+    allowSubagents: Boolean(opts["allow-subagents"]),
     rolePerms,
     ...perms,
     model: opts.model ?? role?.meta.model ?? null,
@@ -1215,7 +1217,7 @@ async function cmdStatus(argv) {
     `role:        ${a.role ?? "-"}`,
     `thread:      ${a.threadId ?? "-"}`,
     `model:       ${a.actual?.model ?? a.model ?? "default"} / effort ${a.effort ?? a.actual?.effort ?? "default"}`,
-    `permissions: mode ${a.mode ?? "-"} → sandbox ${a.actual?.sandbox ?? a.sandbox ?? "default"}, approval ${a.approval ?? "never"}`,
+    `permissions: mode ${a.mode ?? "-"} → sandbox ${a.actual?.sandbox ?? a.sandbox ?? "default"}, approval ${a.approval ?? "never"}, sub-agents ${a.allowSubagents ? "allowed" : "off"}`,
     `cwd:         ${a.cwd}`,
   ];
   const pend = ping?.pending ? await control(a, { op: "pending" }, 1500) : null;
@@ -1353,7 +1355,7 @@ const USAGE = `codex-subagent — Codex threads as Claude Code subagents
   start [--name N] [--description D] [--role R] [--worktree] [--cwd DIR]
         [--mode bypassPermissions|auto|acceptEdits|default|plan|dontAsk]
         [--sandbox read-only|workspace-write|danger-full-access] [--approval untrusted|on-request|never]
-        [--model M] [--effort E]
+        [--model M] [--effort E] [--allow-subagents]
         [--remote --env ENV_ID [--branch B]]  [PROMPT | - | --file F]
   send <name> [--mode M] [MESSAGE | - | --file F]   steer the running turn, or continue in a new turn
   stop <name>                              interrupt the running turn
