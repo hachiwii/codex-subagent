@@ -499,7 +499,10 @@ class AppServer {
       throw Object.assign(new Error(`codex-subagent does not handle ${method}`), { code: -32601 });
     };
     // Same process group as the host: TaskStop's SIGTERM/SIGKILL reaches app-server too.
-    this.proc = spawn(codexBin(), ["app-server"], { cwd, env, stdio: ["pipe", "pipe", "pipe"] });
+    // A Codex subagent does not spawn agents of its own: the coordinator decides who runs. agents.enabled is
+    // what removes the spawn_agent tools (the multi_agent feature flags do not); the override applies to this
+    // app-server process only, not to other Codex instances or the user's config.
+    this.proc = spawn(codexBin(), ["app-server", "-c", "agents.enabled=false"], { cwd, env, stdio: ["pipe", "pipe", "pipe"] });
     this.proc.stderr.pipe(fs.createWriteStream(logFile, { flags: "a" }));
     this.exited = new Promise((resolve) => {
       const fail = (err) => {
