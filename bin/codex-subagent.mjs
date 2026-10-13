@@ -45,6 +45,7 @@ const APPROVAL_METHODS = new Set([
   "execCommandApproval",
   "applyPatchApproval",
 ]);
+const WATCH_LINE_MAX = 480; // Monitor cuts a line at 500 characters
 const EXIT = { completed: 0, failed: 1, stopped: 0 }; // a stop is requested, not a failure
 const NO_USER_ANSWER =
   "No interactive user is available. Decide yourself if you reasonably can and say what you assumed; " +
@@ -164,6 +165,7 @@ function paths(dir) {
     serverLog: path.join(dir, "app-server.log"),
     prompts: path.join(dir, "prompts"),
     cursor: path.join(dir, "watch.json"),
+    messages: path.join(dir, "messages"),
   };
 }
 // An agent carries the directory it was read from; it is not part of agent.json.
@@ -1268,6 +1270,17 @@ async function cmdWatch(argv) {
   if (opts.verbose) for (const k of ["commentary", "command", "file", "tool", "steer", "turn-start", "approval-answer"]) kinds.add(k);
   let offset = opts["from-start"] ? 0 : (readJson(p.cursor)?.offset ?? 0);
   let last = null; // kind of the most recent event read
+  // A Monitor notification carries 500 characters of a line and drops the rest. A longer line is cut short
+  // here instead and names a file that holds the whole text.
+  const emit = (text, key) => {
+    const line = `[${name}] ${text}`;
+    if (line.length <= WATCH_LINE_MAX) return console.log(line);
+    const file = path.join(p.messages, `${key}.txt`);
+    fs.mkdirSync(p.messages, { recursive: true });
+    fs.writeFileSync(file, `${text}\n`);
+    const pointer = ` … [truncated — full text (${text.length} chars): ${file}]`;
+    console.log(line.slice(0, WATCH_LINE_MAX - pointer.length) + pointer);
+  };
   const readNew = () => {
     const size = fs.existsSync(p.events) ? fs.statSync(p.events).size : 0;
     if (size <= offset) return [];
@@ -1277,8 +1290,16 @@ async function cmdWatch(argv) {
     fs.closeSync(fd);
     const complete = buf.subarray(0, buf.lastIndexOf(0x0a) + 1);
     if (!complete.length) return [];
-    const events = complete.toString("utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
-    for (const ev of events) if (kinds.has(ev.kind)) console.log(`[${name}] ${ev.text}`);
+    const events = [];
+    let at = offset; // byte position of the event in the log: a stable name for its message file
+    for (const raw of complete.toString("utf8").split("\n")) {
+      if (raw) {
+        const ev = JSON.parse(raw);
+        events.push(ev);
+        if (kinds.has(ev.kind)) emit(ev.text, `${String(at).padStart(10, "0")}-${ev.kind}`);
+      }
+      at += Buffer.byteLength(raw) + 1;
+    }
     offset += complete.length;
     writeJsonAtomic(p.cursor, { offset });
     last = events.at(-1).kind;
@@ -1290,7 +1311,7 @@ async function cmdWatch(argv) {
   const pend = await control(a, { op: "pending" }, 1500);
   for (const r of pend?.pending ?? []) {
     if (backlog.some((ev) => ev.kind === "approval" && ev.text.startsWith(`⚠ approval #${r.id} `))) continue;
-    console.log(`[${name}] ⚠ approval #${r.id} (still waiting) — ${r.text} → answer: approve ${name} ${r.id} | deny ${name} ${r.id} --reason "…"`);
+    emit(`⚠ approval #${r.id} (still waiting) — ${r.text} → answer: approve ${name} ${r.id} | deny ${name} ${r.id} --reason "…"`, `approval-${r.id}-waiting`);
   }
   for (let idle = 0; ; ) {
     await sleep(500);

@@ -56,6 +56,8 @@ Whenever the mode lets Codex ask (`auto`, `acceptEdits`, `default`), **keep `Mon
 
 (or `file changes: add/update <paths>`, or `additional permissions {…}`). Answer it:
 
+A Monitor notification carries only 500 characters of a line, so `watch` cuts a longer line short and ends it with `[truncated — full text (N chars): <path>]`. **`Read` that file before you act on the event**: the cut part may be the end of a command you are asked to approve, or the point of a message.
+
 - `CS approve N 3` — allow this once. `--session` also allows the same request for the rest of the session.
 - `CS deny N 3 --reason "…"` — refuse; Codex continues the turn and receives the reason, so say what to do instead. `--cancel` refuses and interrupts the turn.
 
