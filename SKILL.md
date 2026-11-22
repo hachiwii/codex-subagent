@@ -5,9 +5,9 @@ description: Run OpenAI Codex as a subagent — delegate a task to a Codex threa
 
 # codex-subagent
 
-`node ~/.claude/skills/codex-subagent/bin/codex-subagent.mjs <command>` (below: `CS`; always write the full path, shell state does not persist).
+`node <skill-dir>/bin/codex-subagent.mjs <command>` (below: `CS`; `<skill-dir>` is `~/.claude/skills/codex-subagent` in Claude Code or `~/.gemini/config/skills/codex-subagent` in Antigravity — always write the full path, shell state does not persist).
 
-Each subagent is one Codex thread. While a turn runs, a **host process** owns it: it runs `codex app-server`, drives the thread and listens for control messages. Run the host as a **background Bash task** (`run_in_background: true`): the task exiting is your completion notification, its output file holds the report, and `TaskStop` on it interrupts the turn.
+Each subagent is one Codex thread. While a turn runs, a **host process** owns it: it runs `codex app-server`, drives the thread and listens for control messages. Run the host as a **background task** (Claude Code `Bash(run_in_background: true)` or Antigravity background `run_command`): the task exiting is your completion notification, its output/log holds the report, and stopping it (`TaskStop` / `manage_task kill`) interrupts the turn.
 
 ## Interface, next to Claude subagents
 
@@ -24,7 +24,7 @@ Each subagent is one Codex thread. While a turn runs, a **host process** owns it
 | subagents belong to the session that spawned them | names are per Claude session; `N` is this session's subagent only; another session's must be addressed explicitly as `<session id prefix>/N` |
 | `TaskStop` | `TaskStop` on the host task, or `CS stop N` |
 | agent transcript / output file | `CS log N` (progress), `CS result N` (last final message), `CS status N`, `CS transcript N` (raw app-server events) |
-| subagent `SendMessage` to main | Codex runs `CS notify "…"`; arm `Monitor` on `CS watch N` to be notified at once. `watch` begins with the events no earlier watch has shown, so nothing is lost when it is attached late or re-armed after the Monitor expired (≤30 min); it also repeats approval requests that are still waiting. Otherwise the messages appear in the turn report |
+| subagent `SendMessage` to main | Codex runs `CS notify "…"`; arm `Monitor` on `CS watch N` (or a background `CS watch N --once` in hosts without `Monitor`, re-arming after each exit) to be notified at once. `watch` begins with the events no earlier watch has shown, so nothing is lost when it is attached late or re-armed; it also repeats approval requests that are still waiting. Otherwise the messages appear in the turn report |
 | `.claude/agents/*.md` agent types | roles: `<repo>/.claude/codex-agents/*.md`, `~/.claude/codex-agents/*.md`, built-in `roles/` (`CS roles` lists them) |
 | `isolation: "worktree"` (auto-removed if unchanged) | `--worktree` or `isolation: worktree` in the role: `<repo>/.claude/worktrees/codex-N` on branch `worktree-codex-N`; removed after a turn that changed nothing, recreated on the next `send` |
 | `isolation: "remote"` | `--remote --env ENV_ID [--branch B]` → Codex Cloud task, polled until done, diff in the report. Codex Cloud cannot steer, continue or cancel: `send` is refused, `stop` only stops watching |
@@ -48,7 +48,7 @@ In `workspace-write`, Codex keeps `.git` read-only, so `git add` / `git commit` 
 
 ## Approvals
 
-Whenever the mode lets Codex ask (`auto`, `acceptEdits`, `default`), **keep `Monitor` on `CS watch N` armed for as long as the subagent runs**. A request nobody answers blocks Codex indefinitely; `CS list` shows such a subagent as `needs approval (n)`. Each request arrives as
+Whenever the mode lets Codex ask (`auto`, `acceptEdits`, `default`), **keep a watcher armed for as long as the subagent runs**: `Monitor` on `CS watch N` in Claude Code, or a background `CS watch N --once` in hosts notified on process exit (such as Antigravity — after answering an event, re-arm `CS watch N --once` until `host-exit`). A request nobody answers blocks Codex indefinitely; `CS list` shows such a subagent as `needs approval (n)`. Each request arrives as
 
 ```
 [N] ⚠ approval #3 — command `…` in <cwd> · reason: <Codex's justification> → answer: approve N 3 | deny N 3 --reason "…"
@@ -93,7 +93,9 @@ Bash(run_in_background: true, description: "Codex subagent fix-parser: …")
   <self-contained task: goal, files, constraints, how to verify, what to report>
   EOF
 ```
-Then, unless the mode is one where Codex never asks: `Monitor(description: "codex subagent fix-parser", timeout_ms: 1800000, command: "node ~/.claude/skills/codex-subagent/bin/codex-subagent.mjs watch fix-parser")`.
+Then, unless the mode is one where Codex never asks:
+- Claude Code: `Monitor(description: "codex subagent fix-parser", timeout_ms: 1800000, command: "node ~/.claude/skills/codex-subagent/bin/codex-subagent.mjs watch fix-parser")`.
+- Antigravity (or other hosts notified on process exit): run `node ~/.gemini/config/skills/codex-subagent/bin/codex-subagent.mjs watch fix-parser --once` as a background task; when it exits with an event, handle it (e.g. `approve` / `deny`) and re-arm `watch fix-parser --once` until `host-exit`.
 
 Correct course mid-turn: `CS send fix-parser - <<'EOF' … EOF` (background). Review in parallel: `CS start --role reviewer --name review-x - <<'EOF' Review git diff main...branch … EOF`.
 
@@ -102,7 +104,7 @@ When the notification arrives, `Read` the output file and relay what matters; do
 ## Notes
 
 - Codex binary: `$CODEX_BIN`, else the ChatGPT app's bundled CLI, else `codex` on PATH.
-- State: `~/.claude/codex-subagents/<claude session id>/<name>/` (`no-session` when run outside Claude Code); a subagent keeps the session that created it even when another session continues it. Subagents from the earlier flat layout (`…/<name>/`, global names) are moved there automatically once they are not running; until then they still answer to their bare name from any session.
+- State: `~/.claude/codex-subagents/<session id>/<name>/` (`CLAUDE_CODE_SESSION_ID`, else `agy-<ANTIGRAVITY_CONVERSATION_ID>`, else `no-session`); a subagent keeps the session that created it even when another session continues it. Subagents from the earlier flat layout (`…/<name>/`, global names) are moved there automatically once they are not running; until then they still answer to their bare name from any session.
 - `--worktree` branches from the HEAD of the directory `start` runs in: `cd` to the main checkout first, not into another agent's worktree.
 - Names: a-z, 0-9, `-`, ≤40 chars; unique within a session (`CS rm N` frees a name; it keeps a worktree that has changes). Two sessions may use the same name; in one repository the second one's worktree gets a suffix (`codex-N-ab12`).
 - A Codex subagent cannot spawn sub-agents of its own: its app-server runs with `agents.enabled=false`, so the `spawn_agent` tools are absent. This applies to the subagent's process only; other Codex instances and `~/.codex/config.toml` are untouched. `start --allow-subagents` lets it spawn them (kept for later turns). **Use `--allow-subagents` only when the user explicitly asks for Codex to use its own sub-agents.**

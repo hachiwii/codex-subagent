@@ -20,7 +20,9 @@ const SELF = fileURLToPath(import.meta.url);
 const SKILL_DIR = path.resolve(path.dirname(SELF), "..");
 const HOME = process.env.CODEX_SUBAGENT_HOME ?? path.join(os.homedir(), ".claude", "codex-subagents");
 const APP_CODEX = "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex";
-const SESSION = process.env.CLAUDE_CODE_SESSION_ID ?? null;
+const SESSION =
+  process.env.CLAUDE_CODE_SESSION_ID ||
+  (process.env.ANTIGRAVITY_CONVERSATION_ID ? `agy-${process.env.ANTIGRAVITY_CONVERSATION_ID}` : null);
 // `notify` prints this line; the host picks it out of the command's output. The id makes each message
 // deliverable once, however often the line shows up again (a log that captured it and is printed later).
 const TO_MAIN = "[[codex-subagent:to-main]]";
@@ -219,7 +221,10 @@ function loadAgent(addr) {
   const slash = addr.lastIndexOf("/");
   const [prefix, name] = slash >= 0 ? [addr.slice(0, slash), addr.slice(slash + 1)] : [null, addr];
   const sid = (a) => a.sessionId ?? NO_SESSION;
-  const label = (a) => `${sid(a).slice(0, 8)}/${a.name}`;
+  const label = (a) => {
+    const s = sid(a);
+    return `${s.slice(0, s.startsWith("agy-") ? 12 : 8)}/${a.name}`;
+  };
   const named = allAgents().filter((a) => a.name === name);
   let hits;
   if (prefix === null) {
@@ -1258,11 +1263,12 @@ function cmdTranscript(argv) {
   console.log(paths(loadAgent(parseArgs(argv).pos[0]).dir).transcript);
 }
 
-// For the Monitor tool: one line per event worth interrupting the coordinator for. It begins with the
-// events no earlier watch has shown (the position is kept per subagent), then follows the host and ends
-// when the host exits.
+// For the Monitor tool (or --once for hosts notified on process exit): one line per event worth
+// interrupting the coordinator for. It begins with the events no earlier watch has shown (the position is
+// kept per subagent), then follows the host and ends when the host exits (or after the next emitted batch
+// with --once).
 async function cmdWatch(argv) {
-  const { opts, pos } = parseArgs(argv, { flags: ["verbose", "from-start"] });
+  const { opts, pos } = parseArgs(argv, { flags: ["verbose", "from-start", "once"] });
   const a = loadAgent(pos[0]);
   const name = a.name;
   const p = paths(a.dir);
@@ -1270,9 +1276,11 @@ async function cmdWatch(argv) {
   if (opts.verbose) for (const k of ["commentary", "command", "file", "tool", "steer", "turn-start", "approval-answer"]) kinds.add(k);
   let offset = opts["from-start"] ? 0 : (readJson(p.cursor)?.offset ?? 0);
   let last = null; // kind of the most recent event read
+  let emitted = 0;
   // A Monitor notification carries 500 characters of a line and drops the rest. A longer line is cut short
   // here instead and names a file that holds the whole text.
   const emit = (text, key) => {
+    emitted++;
     const line = `[${name}] ${text}`;
     if (line.length <= WATCH_LINE_MAX) return console.log(line);
     const file = path.join(p.messages, `${key}.txt`);
@@ -1313,10 +1321,11 @@ async function cmdWatch(argv) {
     if (backlog.some((ev) => ev.kind === "approval" && ev.text.startsWith(`⚠ approval #${r.id} `))) continue;
     emit(`⚠ approval #${r.id} (still waiting) — ${r.text} → answer: approve ${name} ${r.id} | deny ${name} ${r.id} --reason "…"`, `approval-${r.id}-waiting`);
   }
+  if (opts.once && emitted > 0) return;
   for (let idle = 0; ; ) {
     await sleep(500);
     if (readNew().length) {
-      if (last === "host-exit") return;
+      if (last === "host-exit" || (opts.once && emitted > 0)) return;
       idle = 0;
     } else if (!hostAlive(a.dir) && ++idle > 20) {
       // No host for 10 s: nothing to follow. Say so unless the backlog already ended with the host's exit.
@@ -1385,7 +1394,7 @@ const USAGE = `codex-subagent — Codex threads as Claude Code subagents
   list [--json]                            subagents of this Claude session
   <name> is a subagent of this session; <session id prefix>/<name> is one of another session.
   status <name>        log <name> [-n N]        result <name>        transcript <name>
-  watch <name> [--verbose] [--from-start]  event stream for the Monitor tool; begins with events no watch has shown yet
+  watch <name> [--once] [--verbose] [--from-start]  event stream (--once: exit after next event)
   notify MESSAGE                           (for Codex) interim message to the coordinator
   roles                rm <name> [--force]
 `;
